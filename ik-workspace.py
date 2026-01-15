@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+===========================================================
+Dual-arm pose-conditioned reachability via IK (Pinocchio)
+===========================================================
+
+目标：
+- 在“某一个给定末端姿态”（orientation固定）条件下，计算左右手各自的可达空间。
+- 方法：任务空间体素采样位置 p，对每个 (p, R_d) 做逆运动学 IK。
+- IK 成功 => 该 p 可达；IK 失败 => 不可达（或该点对当前多初值策略未收敛）。
+
+你将得到：
+- left_reachable.csv / left_reachable.npy  : 左手可达点集
+- right_reachable.csv / right_reachable.npy: 右手可达点集
+- 可选：Meshcat 显示机器人 + 左/右可达点云
+
+为什么这更符合 mentor 的“给定姿态下可达空间”：
+- 你原来的 FK+蒙特卡洛，是对所有姿态混合后的 position-workspace。
+- 这里是固定 R_d（或部分姿态约束），得到“姿态切片”的 workspace。
+
+依赖：
+pip install pin meshcat numpy pandas
+
+注意：
+- URDF 中 mesh 路径常用 package://，需要 package_dirs 才能加载完整 visual。
+- 如果自动找不到左右末端 frame，会打印候选列表，需改关键词或手动指定 frame 名。
+"""
+
+import os
+import time
+import numpy as np
+import pandas as pd
+import pinocchio as pin
+
+# ========== 可选 Meshcat 可视化 ==========
+USE_MESHCAT = True
+try:
+    from pinocchio.visualize import MeshcatVisualizer
+    import meshcat.geometry as g
+except Exception:
+    USE_MESHCAT = False
+
+
+# ===========================================================
+# 1) 用户可配置区：你通常只需要改这里
+# ===========================================================
+
+# URDF 路径（你 notebook 里用的那个）
+URDF_PATH = "/anyverse/sub_modules/isaacros/src/wheeled_humanoid/robot_model/urdf/wheel_robot.urdf"
+
+# Root joint 选择：
+# - 固定底座：ROOT_JOINT=None（一般是 humanoid 固定在地面）
+# - 浮动底座：ROOT_JOINT=pin.JointModelFreeFlyer()
+ROOT_JOINT = None
+
+# 自动寻找末端 frame 的关键词（按你模型命名习惯改）
+LEFT_EE_KEYWORDS  = ["left_gripper", "left_hand", "l_gripper", "l_hand", "left_tip", "left_wrist"]
+RIGHT_EE_KEYWORDS = ["right_gripper", "right_hand", "r_gripper", "r_hand", "right_tip", "right_wrist"]
+
+# IK 迭代参数（LM/阻尼最小二乘）
+IK_MAX_ITERS = 80          # 每次 IK 最多迭代次数
+IK_DAMPING  = 1e-3         # 阻尼系数 λ（避免奇异）
+IK_STEP     = 0.6          # 步长 α（<1 更稳定）
+
+# 收敛阈值：位置误差(m) + 姿态误差(rad)
+EPS_POS = 2e-3             # 2mm
+EPS_ROT = 3e-2             # 0.03rad ~ 1.7deg（更严格可设小，比如 0.01）
+
+# 每个目标点最多尝试多少个初始值（multi-start）
+MULTI_START = 6
+
+# 体素分辨率：越小越精细但越慢
+VOXEL = 0.05  # 5cm
+
+# 自动估计采样包围盒：先用 FK 随机采样粗估 reachable 区域范围，便于确定扫点范围
+BBOX_EST_SAMPLES = 2500
+BBOX_MARGIN = 0.05
+
+# 如果你已经知道想扫的空间范围，可手动写死（覆盖自动估计）
+LEFT_BBOX_MANUAL  = None
+RIGHT_BBOX_MANUAL = None
+# 示例：
+# LEFT_BBOX_MANUAL  = dict(x=(-0.6, 0.6), y=(-0.8, 0.2), z=(0.2, 1.2))
+# RIGHT_BBOX_MANUAL = dict(x=(-0.6, 0.6), y=(-0.2, 0.8), z=(0.2, 1.2))
+
+# 输出目录
+OUT_DIR = "./ik_reachability_out"
+
+
+# ===========================================================
+# 2) 小工具函数
+# ===========================================================
+
+def guess_package_dirs(urdf_path: str):
+    """
+    用来给 Pinocchio 解析 URDF 里的 package://xxx/meshes/... 路径。
+    原理：把 URDF 所在目录及其上层目录加入 package_dirs 作为搜索根。
+    这不是完美方案，但通常能跑通；若仍缺 mesh，建议手工补充正确的 package 根目录。
+    """
+    dirs = []
+    if not urdf_path:
+        return dirs
+    urdf_dir = os.path.dirname(urdf_path)
+    dirs.append(urdf_dir)
+
+    # 添加几层上级目录作为候选搜索根
+    cur = urdf_dir
+    for _ in range(6):
+        cur = os.path.dirname(cur)
+        if cur and cur not in dirs:
+            dirs.append(cur)
+
+    # 你的环境里常见的额外根目录
+    dirs.append("/anyverse")
+
+    # 去重 + 过滤不存在路径
+    dirs = [d for d in dict.fromkeys(dirs) if os.path.isdir(d)]
+    return dirs
+
+
+def find_frame_by_keywords(model: pin.Model, keywords):
+    """
+    在 model.frames 里按关键词匹配 frame 名称，找到就返回第一个匹配的 name。
+    """
+    kw = [k.lower() for k in keywords]
+    for f in model.frames:
+        name = f.name.lower()
+        if any(k in name for k in kw):
+            return f.name
+    return None
+
+
+def list_frame_candidates(model: pin.Model, contains_any):
+    """
+    打印候选 frame 列表时用：列出包含某些关键词的 frame 名，帮助你手动选末端。
+    """
+    keys = [k.lower() for k in contains_any]
+    cands = []
+    for f in model.frames:
+        n = f.name.lower()
+        if any(k in n for k in keys):
+            cands.append(f.name)
+    return cands
+
+
+def chain_joint_ids_from_frame(model: pin.Model, frame_name: str):
+    """
+    从末端 frame 往上追溯 parent joint，直到 universe(0)，得到该 frame 对应的关节链条。
+    输出：joint id 列表（不包含 universe=0）
+    """
+    if not model.existFrame(frame_name):
+        raise ValueError(f"Frame '{frame_name}' not found.")
+
+    fid = model.getFrameId(frame_name)
+    jid = model.frames[fid].parent  # frame 所属的 parent joint
+    chain = []
+    while jid > 0:
+        chain.append(jid)
+        jid = model.parents[jid]
+    chain.reverse()  # 从基座到末端
+    return chain
+
+
+def joint_ids_to_q_indices(model: pin.Model, joint_ids):
+    """
+    Pinocchio 里关节配置 q 是一个向量（长度 nq），每个 joint 在 q 里占用 [idx_q, idx_q+nq)。
+    这里把 joint id 链条转换成“在 q 向量里需要更新的下标集合 active_q_idx”。
+    """
+    idx = []
+    for jid in joint_ids:
+        j = model.joints[jid]
+        start = j.idx_q
+        nq = j.nq
+        idx.extend(range(start, start + nq))
+    return sorted(set(idx))
+
+
+def clamp_to_limits(model: pin.Model, q: np.ndarray):
+    """
+    把 q 限制在关节上下限内（如果该关节有限制）。
+    对没有上下限（inf）的维度不做 clamp。
+    """
+    q2 = q.copy()
+    lo = model.lowerPositionLimit
+    hi = model.upperPositionLimit
+    finite = np.isfinite(lo) & np.isfinite(hi)
+    q2[finite] = np.minimum(np.maximum(q2[finite], lo[finite]), hi[finite])
+    return q2
+
+
+def rand_in_limits(model: pin.Model, q_ref: np.ndarray, active_q_idx):
+    """
+    生成一个随机初始姿态 q：
+    - active_q_idx 对应的关节维度随机采样
+    - 其他维度保持 q_ref（固定全身姿态，只让该臂动）
+    """
+    q = q_ref.copy()
+    lo = model.lowerPositionLimit
+    hi = model.upperPositionLimit
+    for k in active_q_idx:
+        if np.isfinite(lo[k]) and np.isfinite(hi[k]) and hi[k] > lo[k]:
+            q[k] = np.random.uniform(lo[k], hi[k])
+        else:
+            q[k] = q_ref[k]
+    return q
+
+
+def se3_error_local(oMf: pin.SE3, oMd: pin.SE3):
+    """
+    SE(3) 上的“局部误差”：
+      err = log( oMf^{-1} * oMd ) in se(3) -> R^6
+    这里 err6 = [v(3), w(3)]，前三维是平移误差，后三维是旋转误差（轴角意义）。
+    """
+    return pin.log6(oMf.actInv(oMd)).vector
+
+
+def compute_frame_pose(model, data, q, frame_id):
+    """
+    给定 q，计算 frame 在世界坐标系下的位姿 oMf。
+    """
+    pin.forwardKinematics(model, data, q)
+    pin.updateFramePlacements(model, data)
+    return data.oMf[frame_id]
+
+
+def compute_frame_jacobian_local(model, data, q, frame_id):
+    """
+    计算 frame 的 6xN 雅可比（LOCAL 坐标系下）。
+    注意：我们用 LOCAL Jacobian 对应上面的局部误差 log(oMf^{-1} oMd)，搭配更一致。
+    """
+    pin.computeJointJacobians(model, data, q)
+    pin.updateFramePlacements(model, data)
+    J6 = pin.getFrameJacobian(model, data, frame_id, pin.ReferenceFrame.LOCAL)
+    return J6
+
+
+def ik_solve_pose_for_arm(
+    model, data,
+    frame_id,              # 要对齐的末端 frame
+    q_init,                # 初始 q
+    oMd: pin.SE3,          # 目标位姿（世界系）
+    active_q_idx,          # 仅更新该臂对应的 q 下标
+    q_ref,                 # 其余维度固定为 q_ref（对应“全身某姿态下只动该臂”）
+    max_iters=IK_MAX_ITERS,
+    damping=IK_DAMPING,
+    step=IK_STEP,
+    eps_pos=EPS_POS,
+    eps_rot=EPS_ROT
+):
+    """
+    数值 IK（阻尼最小二乘 / LM）：
+      dq = J^T (J J^T + λ^2 I)^{-1} * err
+    然后只更新 active_q_idx 对应的维度，其它维度严格固定为 q_ref。
+
+    返回：
+      success: 是否收敛
+      q_sol:   求得的 q（全维度，含固定维度）
+      err6:    最终误差（6维）
+    """
+    q = clamp_to_limits(model, q_init)
+    I6 = np.eye(6)
+
+    for _ in range(max_iters):
+        # 当前末端位姿
+        oMf = compute_frame_pose(model, data, q, frame_id)
+
+        # 局部误差：log(oMf^{-1} oMd)
+        err6 = se3_error_local(oMf, oMd)
+
+        # 分别计算位置误差和旋转误差，用于收敛判据
+        pos_err = np.linalg.norm(err6[:3])
+        rot_err = np.linalg.norm(err6[3:])
+
+        if pos_err < eps_pos and rot_err < eps_rot:
+            return True, q, err6
+
+        # 末端雅可比（LOCAL）
+        J6 = compute_frame_jacobian_local(model, data, q, frame_id)
+
+        # 只保留该臂关节对应列：6 x k
+        J = J6[:, active_q_idx]
+
+        # LM/阻尼最小二乘：解出 dq_active
+        A = J @ J.T + (damping ** 2) * I6
+        dq_active = J.T @ np.linalg.solve(A, err6)
+
+        # 更新 q：只更新 active 维度
+        q_new = q.copy()
+        q_new[active_q_idx] = q[active_q_idx] + step * dq_active
+
+        # 非 active 维度严格固定在 q_ref（实现“给定全身姿态，只动该臂”）
+        non_active = np.ones(model.nq, dtype=bool)
+        non_active[active_q_idx] = False
+        q_new[non_active] = q_ref[non_active]
+
+        q = clamp_to_limits(model, q_new)
+
+    # 迭代结束仍未收敛：返回失败
+    oMf = compute_frame_pose(model, data, q, frame_id)
+    err6 = se3_error_local(oMf, oMd)
+    return False, q, err6
+
+
+def build_voxel_grid(bbox, voxel):
+    """
+    根据 bbox 生成体素网格中心点集合。
+    bbox: {"x":(xmin,xmax), "y":(...), "z":(...)}
+    返回：N x 3 的点集
+    """
+    xs = np.arange(bbox["x"][0], bbox["x"][1] + 1e-9, voxel)
+    ys = np.arange(bbox["y"][0], bbox["y"][1] + 1e-9, voxel)
+    zs = np.arange(bbox["z"][0], bbox["z"][1] + 1e-9, voxel)
+    pts = np.array(np.meshgrid(xs, ys, zs, indexing="xy"), dtype=float)
+    return pts.reshape(3, -1).T
+
+
+def estimate_bbox_via_random_fk(model, data, frame_id, q_ref, active_q_idx,
+                                n_samples=2000, margin=0.05):
+    """
+    用随机 FK 粗估该臂末端能到达的位置范围：
+    - 随机采样该臂关节（其它关节固定在 q_ref）
+    - 计算末端位置点云
+    - 取 min/max 得到 bbox，再扩 margin
+
+    这一步仅用于确定“扫点范围”，最终可达性判定仍由 IK 决定。
+    """
+    pts = []
+    for _ in range(n_samples):
+        q = rand_in_limits(model, q_ref, active_q_idx)
+        oMf = compute_frame_pose(model, data, q, frame_id)
+        pts.append(oMf.translation.copy())
+    pts = np.array(pts)
+
+    mn = pts.min(axis=0) - margin
+    mx = pts.max(axis=0) + margin
+    return {"x": (mn[0], mx[0]), "y": (mn[1], mx[1]), "z": (mn[2], mx[2])}
+
+
+def save_points(points, csv_path, npy_path):
+    """
+    保存结果点云到 npy 和 csv，便于后续画图/统计。
+    """
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    np.save(npy_path, points)
+    pd.DataFrame(points, columns=["x", "y", "z"]).to_csv(csv_path, index=False)
+
+
+# ===========================================================
+# 3) 主流程
+# ===========================================================
+
+def main():
+    np.random.seed(0)
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    if not os.path.exists(URDF_PATH):
+        raise FileNotFoundError(f"URDF not found: {URDF_PATH}")
+
+    # 给 pinocchio 解析 package:// mesh 用
+    package_dirs = guess_package_dirs(URDF_PATH)
+    print("[INFO] URDF:", URDF_PATH)
+    print("[INFO] package_dirs:")
+    for d in package_dirs:
+        print("   -", d)
+
+    # 构建模型（含 collision & visual）
+    if ROOT_JOINT is None:
+        model, collision_model, visual_model = pin.buildModelsFromUrdf(URDF_PATH, package_dirs)
+    else:
+        model, collision_model, visual_model = pin.buildModelsFromUrdf(URDF_PATH, package_dirs, ROOT_JOINT)
+
+    data = model.createData()
+
+    # 参考全身姿态 q_ref：neutral 通常对应 URDF 默认零位姿（或你定义的基准姿态）
+    # 这就是“某一个给定姿态”的实现载体：把 q_ref 换成 mentor 给的姿态即可。
+    q_ref = pin.neutral(model)
+
+    # 自动找左右末端 frame
+    left_frame = find_frame_by_keywords(model, LEFT_EE_KEYWORDS)
+    right_frame = find_frame_by_keywords(model, RIGHT_EE_KEYWORDS)
+
+    # 找不到就输出候选，让你手动改关键词
+    if left_frame is None or right_frame is None:
+        print("[WARN] Cannot auto-find both EE frames.")
+        print("  Left candidates:", list_frame_candidates(model, ["left", "l_", "hand", "gripper", "wrist", "tip"])[:60])
+        print("  Right candidates:", list_frame_candidates(model, ["right", "r_", "hand", "gripper", "wrist", "tip"])[:60])
+        raise RuntimeError("Please adjust LEFT_EE_KEYWORDS / RIGHT_EE_KEYWORDS to match your model frame names.")
+
+    left_fid = model.getFrameId(left_frame)
+    right_fid = model.getFrameId(right_frame)
+    print("[INFO] Left EE frame:", left_frame, "id=", left_fid)
+    print("[INFO] Right EE frame:", right_frame, "id=", right_fid)
+
+    # 计算左右臂的关节链，并提取 q 中的 active 下标
+    left_joint_chain = chain_joint_ids_from_frame(model, left_frame)
+    right_joint_chain = chain_joint_ids_from_frame(model, right_frame)
+    left_active_q = joint_ids_to_q_indices(model, left_joint_chain)
+    right_active_q = joint_ids_to_q_indices(model, right_joint_chain)
+
+    print("[INFO] Left chain joints:", len(left_joint_chain), "active q dims:", len(left_active_q))
+    print("[INFO] Right chain joints:", len(right_joint_chain), "active q dims:", len(right_active_q))
+
+    # ===========================================================
+    # 关键：定义“给定姿态” R_d
+    # ===========================================================
+    # 默认取 q_ref 下末端当前旋转，等价于“在该参考姿态下固定末端方向”
+    left_oMf_ref = compute_frame_pose(model, data, q_ref, left_fid)
+    right_oMf_ref = compute_frame_pose(model, data, q_ref, right_fid)
+    LEFT_R_d = left_oMf_ref.rotation.copy()
+    RIGHT_R_d = right_oMf_ref.rotation.copy()
+
+    # 如果你要显式指定“手掌朝下”等：
+    # 例如让末端 z 轴对齐世界 -z（这只是示意，具体看你的末端坐标系定义）
+    # z_d = np.array([0, 0, -1.0])
+    # 你需要构造一个完整的 R_d（给一个 x 轴或用 Gram-Schmidt 构造正交基），此处略。
+
+    # ===========================================================
+    # 建立扫点范围 bbox + 体素网格
+    # ===========================================================
+    if LEFT_BBOX_MANUAL is not None:
+        left_bbox = LEFT_BBOX_MANUAL
+    else:
+        print("[INFO] Estimating LEFT bbox via random FK ...")
+        left_bbox = estimate_bbox_via_random_fk(
+            model, data, left_fid, q_ref, left_active_q,
+            n_samples=BBOX_EST_SAMPLES, margin=BBOX_MARGIN
+        )
+
+    if RIGHT_BBOX_MANUAL is not None:
+        right_bbox = RIGHT_BBOX_MANUAL
+    else:
+        print("[INFO] Estimating RIGHT bbox via random FK ...")
+        right_bbox = estimate_bbox_via_random_fk(
+            model, data, right_fid, q_ref, right_active_q,
+            n_samples=BBOX_EST_SAMPLES, margin=BBOX_MARGIN
+        )
+
+    print("[INFO] LEFT bbox:", left_bbox)
+    print("[INFO] RIGHT bbox:", right_bbox)
+
+    left_grid = build_voxel_grid(left_bbox, VOXEL)
+    right_grid = build_voxel_grid(right_bbox, VOXEL)
+    print("[INFO] LEFT grid points:", len(left_grid))
+    print("[INFO] RIGHT grid points:", len(right_grid))
+
+    # ===========================================================
+    # Meshcat 可视化：显示机器人模型
+    # ===========================================================
+    viz = None
+    if USE_MESHCAT:
+        viz = MeshcatVisualizer(model, collision_model, visual_model)
+        viz.initViewer(open=True)
+        viz.loadViewerModel()
+        viz.display(q_ref)
+
+    # ===========================================================
+    # 左臂 IK 扫描
+    # ===========================================================
+    left_reachable = []
+
+    # continuation：用上一个成功点的解做下一个点的初值，能显著提高成功率和速度
+    q_prev = q_ref.copy()
+
+    print("[RUN] Solving IK for LEFT arm ...")
+    t0 = time.time()
+    for i, p in enumerate(left_grid):
+        # 目标位姿：世界系下 oMd = (R_d, p)
+        oMd = pin.SE3(LEFT_R_d, p)
+
+        # multi-start 初值集合：
+        # 1) q_prev：连续性很强时最有效
+        # 2) q_ref：基准姿态
+        # 3) 若干随机初值：防止局部最小导致“明明可达但没收敛”
+        inits = [q_prev, q_ref]
+        for _ in range(max(0, MULTI_START - len(inits))):
+            inits.append(rand_in_limits(model, q_ref, left_active_q))
+
+        success = False
+        q_sol_best = None
+
+        # 依次尝试不同初值，只要有一个收敛就算该点可达
+        for q0 in inits[:MULTI_START]:
+            ok, q_sol, err6 = ik_solve_pose_for_arm(
+                model, data,
+                frame_id=left_fid,
+                q_init=q0,
+                oMd=oMd,
+                active_q_idx=left_active_q,
+                q_ref=q_ref
+            )
+            if ok:
+                success = True
+                q_sol_best = q_sol
+                break
+
+        if success:
+            left_reachable.append(p)
+            q_prev = q_sol_best  # 更新 continuation 初值
+
+        # 打印进度
+        if (i + 1) % 2000 == 0:
+            dt = time.time() - t0
+            print(f"  LEFT {i+1}/{len(left_grid)} | reachable={len(left_reachable)} | {dt:.1f}s")
+
+    left_reachable = np.array(left_reachable, dtype=float)
+    print(f"[DONE] LEFT reachable points: {len(left_reachable)}")
+
+    # ===========================================================
+    # 右臂 IK 扫描（同理）
+    # ===========================================================
+    right_reachable = []
+    q_prev = q_ref.copy()
+
+    print("[RUN] Solving IK for RIGHT arm ...")
+    t0 = time.time()
+    for i, p in enumerate(right_grid):
+        oMd = pin.SE3(RIGHT_R_d, p)
+
+        inits = [q_prev, q_ref]
+        for _ in range(max(0, MULTI_START - len(inits))):
+            inits.append(rand_in_limits(model, q_ref, right_active_q))
+
+        success = False
+        q_sol_best = None
+        for q0 in inits[:MULTI_START]:
+            ok, q_sol, err6 = ik_solve_pose_for_arm(
+                model, data,
+                frame_id=right_fid,
+                q_init=q0,
+                oMd=oMd,
+                active_q_idx=right_active_q,
+                q_ref=q_ref
+            )
+            if ok:
+                success = True
+                q_sol_best = q_sol
+                break
+
+        if success:
+            right_reachable.append(p)
+            q_prev = q_sol_best
+
+        if (i + 1) % 2000 == 0:
+            dt = time.time() - t0
+            print(f"  RIGHT {i+1}/{len(right_grid)} | reachable={len(right_reachable)} | {dt:.1f}s")
+
+    right_reachable = np.array(right_reachable, dtype=float)
+    print(f"[DONE] RIGHT reachable points: {len(right_reachable)}")
+
+    # ===========================================================
+    # 保存结果
+    # ===========================================================
+    save_points(left_reachable,
+                csv_path=os.path.join(OUT_DIR, "left_reachable.csv"),
+                npy_path=os.path.join(OUT_DIR, "left_reachable.npy"))
+    save_points(right_reachable,
+                csv_path=os.path.join(OUT_DIR, "right_reachable.csv"),
+                npy_path=os.path.join(OUT_DIR, "right_reachable.npy"))
+
+    print("[OUT] saved to:", OUT_DIR)
+
+    # ===========================================================
+    # Meshcat 画点云（左红右蓝），帮助你直观看 workspace 切片
+    # ===========================================================
+    if USE_MESHCAT and viz is not None:
+        viewer = viz.viewer
+
+        if len(left_reachable) > 0:
+            pts = left_reachable.T  # 3 x N
+            colors = np.zeros((3, pts.shape[1]))
+            colors[0, :] = 1.0
+            viewer["reachability_left"].set_object(
+                g.PointCloud(position=pts, color=colors, size=0.01)
+            )
+
+        if len(right_reachable) > 0:
+            pts = right_reachable.T
+            colors = np.zeros((3, pts.shape[1]))
+            colors[2, :] = 1.0
+            viewer["reachability_right"].set_object(
+                g.PointCloud(position=pts, color=colors, size=0.01)
+            )
+
+        viz.display(q_ref)
+        print("[VIS] Meshcat updated. You can rotate/zoom in the viewer window.")
+
+
+if __name__ == "__main__":
+    main()
