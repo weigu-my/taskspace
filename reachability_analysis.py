@@ -37,6 +37,7 @@ import torch
 try:
     from curobo.types.math import Pose
     from curobo.types.robot import JointState
+    from curobo.types.base import TensorDeviceType
     from curobo.cuda_robot_model.cuda_robot_model import CudaRobotModel
     from curobo.geom.sdf.world import WorldCollision
     from curobo.wrap.reacher.ik_solver import IKSolver, IKSolverConfig
@@ -242,6 +243,9 @@ class CuroboIKSolver(IKSolverBase):
         print(f"[INFO] 初始化 cuRobo IKSolver: {arm_config.name}")
         print(f"[INFO] 使用设备: {self.device}")
 
+        # 创建 TensorDeviceType 对象
+        self.tensor_args = TensorDeviceType(device=self.device, dtype=torch.float32)
+
         # 加载 IK 求解器配置
         ik_config = IKSolverConfig.load_from_robot_config(
             arm_config.robot_config_file,
@@ -251,7 +255,7 @@ class CuroboIKSolver(IKSolverBase):
             num_seeds=arm_config.num_seeds,
             self_collision_check=True,
             self_collision_opt=True,
-            tensor_args={"device": self.device, "dtype": torch.float32},
+            tensor_args=self.tensor_args,
         )
 
         self.ik_solver = IKSolver(ik_config)
