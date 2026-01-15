@@ -1,0 +1,18 @@
+# 忽略 Python 编译文件
+__pycache__/
+*.pyc
+
+# 忽略大数据文件 (关键！)
+*.npy
+*.npz
+*.csv
+*.json
+*.html
+
+# 忽略输出文件夹 (如果有)
+reachability_output/
+ik_reachability_out/
+results/
+
+# 忽略 Mac 系统文件 (如果你同事用 Mac)
+.DS_Store
