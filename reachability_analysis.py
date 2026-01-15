@@ -93,6 +93,10 @@ class ReachabilityConfig:
     ])
     num_random_orientations: int = 1   # 随机模式下每个位置采样的姿态数
 
+    # 灵巧性分析参数
+    compute_dexterity: bool = True     # 是否计算灵巧性
+    num_dexterity_orientations: int = 12  # 测试灵巧性的姿态数量
+
     # 批处理参数
     batch_size: int = 1024             # GPU batch 大小
 
@@ -495,7 +499,7 @@ class ReachabilityAnalyzer:
             raise ValueError(f"未知的姿态模式: {mode}")
 
     def analyze_arm(self, arm_name: str) -> dict:
-        """分析单个机械臂的可达性"""
+        """分析单个机械臂的可达性和灵巧性"""
         if arm_name not in self.solvers:
             raise ValueError(f"未找到机械臂: {arm_name}")
 
@@ -513,46 +517,55 @@ class ReachabilityAnalyzer:
         n_points = len(grid_points)
         print(f"[INFO] {arm_name}: 网格点数 = {n_points}")
 
-        # 获取姿态
-        orientations = self._get_orientations(n_points)
+        # 生成用于灵巧性测试的多个姿态
+        n_orientations = self.config.num_dexterity_orientations
+        test_orientations = sample_uniform_quaternions(n_orientations, seed=42)
+        print(f"[INFO] 测试姿态数: {n_orientations}")
 
-        # 批量求解
-        all_success = np.zeros(n_points, dtype=bool)
-        all_pos_err = np.zeros(n_points)
-        all_rot_err = np.zeros(n_points)
+        # 灵巧性分数：每个点能用多少种姿态到达
+        dexterity_scores = np.zeros(n_points, dtype=np.int32)
 
         batch_size = self.config.batch_size
-        n_batches = (n_points + batch_size - 1) // batch_size
-
-        print(f"[RUN] 开始 IK 求解 ({n_batches} batches, batch_size={batch_size})...")
         t0 = time.time()
 
-        for i in range(n_batches):
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size, n_points)
+        # 对每种姿态进行测试
+        for ori_idx, orientation in enumerate(test_orientations):
+            print(f"[RUN] 测试姿态 {ori_idx+1}/{n_orientations}...")
 
-            batch_pos = grid_points[start_idx:end_idx]
-            batch_quat = orientations[start_idx:end_idx]
+            # 为所有点使用同一姿态
+            orientations = np.tile(orientation, (n_points, 1))
 
-            success, pos_err, rot_err = solver.solve_batch(batch_pos, batch_quat)
+            n_batches = (n_points + batch_size - 1) // batch_size
 
-            all_success[start_idx:end_idx] = success
-            all_pos_err[start_idx:end_idx] = pos_err
-            all_rot_err[start_idx:end_idx] = rot_err
+            for i in range(n_batches):
+                start_idx = i * batch_size
+                end_idx = min((i + 1) * batch_size, n_points)
 
-            if (i + 1) % 10 == 0 or (i + 1) == n_batches:
-                elapsed = time.time() - t0
-                n_reachable = np.sum(all_success[:end_idx])
-                print(f"  Batch {i+1}/{n_batches} | "
-                      f"可达: {n_reachable}/{end_idx} ({100*n_reachable/end_idx:.1f}%) | "
-                      f"耗时: {elapsed:.1f}s")
+                batch_pos = grid_points[start_idx:end_idx]
+                batch_quat = orientations[start_idx:end_idx]
+
+                success, _, _ = solver.solve_batch(batch_pos, batch_quat)
+
+                # 累加成功次数
+                dexterity_scores[start_idx:end_idx] += success.astype(np.int32)
+
+            # 显示进度
+            elapsed = time.time() - t0
+            n_reachable = np.sum(dexterity_scores > 0)
+            avg_dexterity = np.mean(dexterity_scores[dexterity_scores > 0]) if n_reachable > 0 else 0
+            print(f"  姿态 {ori_idx+1} 完成 | 可达点: {n_reachable} | "
+                  f"平均灵巧性: {avg_dexterity:.2f}/{ori_idx+1} | 耗时: {elapsed:.1f}s")
 
         total_time = time.time() - t0
 
         # 收集结果
-        reachable_mask = all_success
+        reachable_mask = dexterity_scores > 0
         reachable_points = grid_points[reachable_mask]
+        reachable_dexterity = dexterity_scores[reachable_mask]
         unreachable_points = grid_points[~reachable_mask]
+
+        # 归一化灵巧性分数 (0-1)
+        normalized_dexterity = reachable_dexterity / n_orientations
 
         result = {
             "arm_name": arm_name,
@@ -563,10 +576,11 @@ class ReachabilityAnalyzer:
             "reachable_ratio": float(np.sum(reachable_mask) / n_points),
             "reachable_points": reachable_points,
             "unreachable_points": unreachable_points,
-            "position_errors": all_pos_err,
-            "rotation_errors": all_rot_err,
+            "dexterity_scores": reachable_dexterity,           # 绝对灵巧性分数
+            "normalized_dexterity": normalized_dexterity,       # 归一化灵巧性 (0-1)
+            "num_orientations_tested": n_orientations,
             "computation_time": total_time,
-            "orientations_used": orientations,
+            "test_orientations": test_orientations,
         }
 
         self.results[arm_name] = result
@@ -595,6 +609,22 @@ class ReachabilityAnalyzer:
                     f"{prefix}_reachable.csv", index=False
                 )
 
+            # 保存灵巧性数据
+            if "dexterity_scores" in result and len(result["dexterity_scores"]) > 0:
+                dexterity = result["dexterity_scores"]
+                normalized = result["normalized_dexterity"]
+
+                # 保存灵巧性分数
+                np.save(f"{prefix}_dexterity.npy", dexterity)
+
+                # 保存带灵巧性的完整数据 (x, y, z, dexterity, normalized_dexterity)
+                full_data = np.column_stack([reachable, dexterity, normalized])
+                np.save(f"{prefix}_reachable_with_dexterity.npy", full_data)
+                pd.DataFrame(
+                    full_data,
+                    columns=["x", "y", "z", "dexterity", "normalized_dexterity"]
+                ).to_csv(f"{prefix}_reachable_with_dexterity.csv", index=False)
+
             # 可选：保存不可达点
             if self.config.save_failed_points:
                 unreachable = result["unreachable_points"]
@@ -610,6 +640,9 @@ class ReachabilityAnalyzer:
                 "reachable_count": result["reachable_count"],
                 "reachable_ratio": result["reachable_ratio"],
                 "computation_time_seconds": result["computation_time"],
+                "num_orientations_tested": result.get("num_orientations_tested", 1),
+                "avg_dexterity": float(np.mean(result.get("dexterity_scores", [0]))),
+                "max_dexterity": int(np.max(result.get("dexterity_scores", [0]))),
             }
 
             import json
@@ -621,7 +654,7 @@ class ReachabilityAnalyzer:
     def print_summary(self):
         """打印分析摘要"""
         print("\n" + "="*60)
-        print("可达性分析摘要")
+        print("可达性与灵巧性分析摘要")
         print("="*60)
 
         for arm_name, result in self.results.items():
@@ -630,8 +663,17 @@ class ReachabilityAnalyzer:
             print(f"  可达点数: {result['reachable_count']}")
             print(f"  可达率: {100*result['reachable_ratio']:.2f}%")
             print(f"  计算时间: {result['computation_time']:.2f}s")
-            print(f"  平均位置误差: {np.mean(result['position_errors'][result['position_errors'] < 0.1]):.4f}m")
-            print(f"  平均旋转误差: {np.mean(result['rotation_errors'][result['rotation_errors'] < 0.5]):.4f}rad")
+
+            # 灵巧性统计
+            if "dexterity_scores" in result and len(result["dexterity_scores"]) > 0:
+                dex = result["dexterity_scores"]
+                n_ori = result["num_orientations_tested"]
+                print(f"  测试姿态数: {n_ori}")
+                print(f"  灵巧性统计:")
+                print(f"    - 平均: {np.mean(dex):.2f}/{n_ori} ({100*np.mean(dex)/n_ori:.1f}%)")
+                print(f"    - 最大: {np.max(dex)}/{n_ori}")
+                print(f"    - 最小: {np.min(dex)}/{n_ori}")
+                print(f"    - 高灵巧性点 (>50%): {np.sum(dex > n_ori/2)} ({100*np.sum(dex > n_ori/2)/len(dex):.1f}%)")
 
 
 # ===================================================================

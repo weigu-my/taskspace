@@ -168,16 +168,37 @@ def create_robot_skeleton(robot_config_file: str = "franka.yml", joint_config: n
 
 def visualize_reachability_with_robot(
     reachable_points_path: str,
+    dexterity_path: str = None,
     output_html: str = "reachability_with_robot.html",
     robot_config: str = "franka.yml",
     title: str = "Arm Reachability with Robot Model",
 ):
     """
     可视化可达空间和机械臂模型
+
+    Args:
+        reachable_points_path: 可达点文件路径 (.npy)
+        dexterity_path: 灵巧性数据路径 (.npy)，如果为 None 则尝试自动查找
+        output_html: 输出 HTML 文件路径
+        robot_config: 机器人配置文件
+        title: 图表标题
     """
     # 加载可达点
     points = np.load(reachable_points_path)
     print(f"[INFO] 加载可达点: {len(points)}")
+
+    # 尝试加载灵巧性数据
+    dexterity = None
+    if dexterity_path is None:
+        # 尝试自动查找
+        auto_path = reachable_points_path.replace("_reachable.npy", "_dexterity.npy")
+        if Path(auto_path).exists():
+            dexterity_path = auto_path
+
+    if dexterity_path and Path(dexterity_path).exists():
+        dexterity = np.load(dexterity_path)
+        print(f"[INFO] 加载灵巧性数据: {len(dexterity)} 点")
+        print(f"[INFO] 灵巧性范围: {dexterity.min()} - {dexterity.max()}")
 
     traces = []
 
@@ -186,8 +207,22 @@ def visualize_reachability_with_robot(
     if len(points) > 8000:
         indices = np.random.choice(len(points), 8000, replace=False)
         points_sample = points[indices]
+        dexterity_sample = dexterity[indices] if dexterity is not None else None
     else:
         points_sample = points
+        dexterity_sample = dexterity
+
+    # 根据是否有灵巧性数据选择颜色
+    if dexterity_sample is not None:
+        # 用灵巧性着色
+        color_values = dexterity_sample
+        colorbar_title = 'Dexterity<br>(# orientations)'
+        colorscale = 'RdYlGn'  # 红-黄-绿，灵巧性越高越绿
+    else:
+        # 用高度着色
+        color_values = points_sample[:, 2]
+        colorbar_title = 'Z (m)'
+        colorscale = 'Viridis'
 
     traces.append(go.Scatter3d(
         x=points_sample[:, 0],
@@ -196,10 +231,10 @@ def visualize_reachability_with_robot(
         mode='markers',
         marker=dict(
             size=2,
-            color=points_sample[:, 2],  # 按高度着色
-            colorscale='Viridis',
-            opacity=0.6,
-            colorbar=dict(title='Z (m)'),
+            color=color_values,
+            colorscale=colorscale,
+            opacity=0.7,
+            colorbar=dict(title=colorbar_title, x=1.02),
         ),
         name=f'Reachable ({len(points)} pts)',
     ))
@@ -261,19 +296,22 @@ def visualize_reachability_with_robot(
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="可达性可视化 + 机械臂模型")
+    parser = argparse.ArgumentParser(description="可达性可视化 + 机械臂模型 + 灵巧性")
     parser.add_argument("data_path", type=str, nargs='?',
-                        default="./reachability_output/left_arm_reachable.npy",
+                        default="./reachability_output/franka_arm_reachable.npy",
                         help="可达点云文件")
+    parser.add_argument("-d", "--dexterity", type=str, default=None,
+                        help="灵巧性数据文件 (可选，默认自动查找)")
     parser.add_argument("-o", "--output", type=str, default="reachability_with_robot.html",
                         help="输出 HTML 文件")
-    parser.add_argument("-t", "--title", type=str, default="Franka Panda Reachability",
+    parser.add_argument("-t", "--title", type=str, default="Franka Panda Reachability & Dexterity",
                         help="图表标题")
 
     args = parser.parse_args()
 
     visualize_reachability_with_robot(
         args.data_path,
+        dexterity_path=args.dexterity,
         output_html=args.output,
         title=args.title,
     )
