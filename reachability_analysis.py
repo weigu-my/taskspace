@@ -641,31 +641,20 @@ class ReachabilityAnalyzer:
 def create_example_config() -> ReachabilityConfig:
     """创建一个示例配置"""
 
-    # 左臂配置
-    left_arm = ArmConfig(
-        name="left_arm",
-        ee_link="left_gripper",
-        robot_config_file="franka.yml",  # 示例，实际使用时替换为真实路径
-        bbox={"x": (-0.6, 0.6), "y": (0.0, 0.8), "z": (0.2, 1.2)},
-        position_threshold=0.005,
-        rotation_threshold=0.05,
-        num_seeds=32,
-    )
-
-    # 右臂配置
-    right_arm = ArmConfig(
-        name="right_arm",
-        ee_link="right_gripper",
+    # 单臂完整工作空间配置（推荐用于单臂机器人）
+    single_arm = ArmConfig(
+        name="franka_arm",
+        ee_link="panda_hand",
         robot_config_file="franka.yml",
-        bbox={"x": (-0.6, 0.6), "y": (-0.8, 0.0), "z": (0.2, 1.2)},
+        bbox={"x": (-0.8, 0.8), "y": (-0.8, 0.8), "z": (0.0, 1.2)},  # 完整范围
         position_threshold=0.005,
         rotation_threshold=0.05,
         num_seeds=32,
     )
 
-    # 全局配置
+    # 全局配置（单臂）
     config = ReachabilityConfig(
-        arms=[left_arm, right_arm],
+        arms=[single_arm],
         voxel_size=0.05,
         orientation_mode=OrientationMode.FIXED,
         fixed_orientations=[
