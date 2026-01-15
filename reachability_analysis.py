@@ -641,25 +641,69 @@ class ReachabilityAnalyzer:
 def create_example_config() -> ReachabilityConfig:
     """创建一个示例配置"""
 
-    # 单臂完整工作空间配置（推荐用于单臂机器人）
+    # 完整工作空间范围（每个臂都计算完整空间，不考虑互相碰撞）
+    full_bbox = {"x": (-0.9, 0.9), "y": (-0.9, 0.9), "z": (0.0, 1.3)}
+
+    # 单臂配置（使用 Franka Panda）
     single_arm = ArmConfig(
         name="franka_arm",
         ee_link="panda_hand",
         robot_config_file="franka.yml",
-        bbox={"x": (-0.8, 0.8), "y": (-0.8, 0.8), "z": (0.0, 1.2)},  # 完整范围
+        bbox=full_bbox,
         position_threshold=0.005,
         rotation_threshold=0.05,
         num_seeds=32,
     )
 
-    # 全局配置（单臂）
+    # 全局配置
     config = ReachabilityConfig(
         arms=[single_arm],
         voxel_size=0.05,
         orientation_mode=OrientationMode.FIXED,
         fixed_orientations=[
             np.array([1.0, 0.0, 0.0, 0.0]),      # 单位四元数
-            np.array([0.707, 0.707, 0.0, 0.0]),  # 绕x轴旋转90度
+        ],
+        batch_size=1024,
+        output_dir="./reachability_output",
+    )
+
+    return config
+
+
+def create_dual_arm_config() -> ReachabilityConfig:
+    """创建双臂配置（每个臂各自计算完整可达空间）"""
+
+    # 完整工作空间范围
+    full_bbox = {"x": (-0.9, 0.9), "y": (-0.9, 0.9), "z": (0.0, 1.3)}
+
+    # 左臂（完整工作空间）
+    left_arm = ArmConfig(
+        name="left_arm",
+        ee_link="panda_hand",
+        robot_config_file="franka.yml",
+        bbox=full_bbox,
+        position_threshold=0.005,
+        rotation_threshold=0.05,
+        num_seeds=32,
+    )
+
+    # 右臂（完整工作空间）
+    right_arm = ArmConfig(
+        name="right_arm",
+        ee_link="panda_hand",
+        robot_config_file="franka.yml",
+        bbox=full_bbox,
+        position_threshold=0.005,
+        rotation_threshold=0.05,
+        num_seeds=32,
+    )
+
+    config = ReachabilityConfig(
+        arms=[left_arm, right_arm],
+        voxel_size=0.05,
+        orientation_mode=OrientationMode.FIXED,
+        fixed_orientations=[
+            np.array([1.0, 0.0, 0.0, 0.0]),
         ],
         batch_size=1024,
         output_dir="./reachability_output",
