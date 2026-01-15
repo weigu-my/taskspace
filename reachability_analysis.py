@@ -318,37 +318,38 @@ class CuroboIKSolver(IKSolverBase):
         # 求解 IK
         result = self.ik_solver.solve_batch(goal_pose)
 
-        # 提取结果
-        success = result.success.cpu().numpy().astype(bool)
+        # 提取结果 (注意: cuRobo 可能返回 (N,1) 形状，需要 flatten)
+        success = result.success.cpu().numpy().astype(bool).flatten()
 
         # 获取达到的位姿并计算误差
-        if hasattr(result, 'goal_pose') and result.goal_pose is not None:
-            achieved_pos = result.goal_pose.position.cpu().numpy()
-            achieved_quat = result.goal_pose.quaternion.cpu().numpy()
+        # 初始化默认误差值
+        position_errors = np.full(n, np.inf)
+        rotation_errors = np.full(n, np.inf)
 
-            position_errors = np.linalg.norm(achieved_pos - positions, axis=1)
+        if hasattr(result, 'goal_pose') and result.goal_pose is not None:
+            achieved_pos = result.goal_pose.position.cpu().numpy().reshape(-1, 3)
+            achieved_quat = result.goal_pose.quaternion.cpu().numpy().reshape(-1, 4)
+
+            position_errors = np.linalg.norm(achieved_pos - positions, axis=1).flatten()
             rotation_errors = np.array([
                 quat_angular_distance(q1, q2)
                 for q1, q2 in zip(achieved_quat, orientations)
-            ])
-        else:
+            ]).flatten()
+
+        elif hasattr(result, 'solution') and result.solution is not None:
             # 如果没有返回达到的位姿，则使用 FK 计算
-            position_errors = np.zeros(n)
-            rotation_errors = np.zeros(n)
+            q_sol = result.solution.position
+            # 执行 FK 获取达到的位姿
+            state = JointState.from_position(q_sol, self.robot_model.joint_names)
+            fk_result = self.robot_model.get_state(state)
+            achieved_pos = fk_result.ee_position.cpu().numpy().reshape(-1, 3)
+            achieved_quat = fk_result.ee_quaternion.cpu().numpy().reshape(-1, 4)
 
-            if hasattr(result, 'solution') and result.solution is not None:
-                q_sol = result.solution.position
-                # 执行 FK 获取达到的位姿
-                state = JointState.from_position(q_sol, self.robot_model.joint_names)
-                fk_result = self.robot_model.get_state(state)
-                achieved_pos = fk_result.ee_position.cpu().numpy()
-                achieved_quat = fk_result.ee_quaternion.cpu().numpy()
-
-                position_errors = np.linalg.norm(achieved_pos - positions, axis=1)
-                rotation_errors = np.array([
-                    quat_angular_distance(q1, q2)
-                    for q1, q2 in zip(achieved_quat, orientations)
-                ])
+            position_errors = np.linalg.norm(achieved_pos - positions, axis=1).flatten()
+            rotation_errors = np.array([
+                quat_angular_distance(q1, q2)
+                for q1, q2 in zip(achieved_quat, orientations)
+            ]).flatten()
 
         return success, position_errors, rotation_errors
 
