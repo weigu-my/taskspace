@@ -271,9 +271,10 @@ class CuroboIKSolver(IKSolverBase):
 
     def _get_joint_limits(self) -> tuple[np.ndarray, np.ndarray]:
         """获取关节限位"""
-        kinematics = self.robot_model
-        lower = kinematics.joint_limits.position[0].cpu().numpy()
-        upper = kinematics.joint_limits.position[1].cpu().numpy()
+        # cuRobo 使用 get_joint_limits() 方法
+        joint_limits = self.robot_model.get_joint_limits()
+        lower = joint_limits.position[0].cpu().numpy()
+        upper = joint_limits.position[1].cpu().numpy()
         return lower, upper
 
     def _warmup(self):
