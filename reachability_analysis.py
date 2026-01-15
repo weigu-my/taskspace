@@ -247,6 +247,7 @@ class CuroboIKSolver(IKSolverBase):
         self.tensor_args = TensorDeviceType(device=self.device, dtype=torch.float32)
 
         # 加载 IK 求解器配置
+        # 注意: use_cuda_graph=False 避免 CUDA < 12.0 时的 Graph 重置问题
         ik_config = IKSolverConfig.load_from_robot_config(
             arm_config.robot_config_file,
             arm_config.world_config_file,
@@ -256,6 +257,7 @@ class CuroboIKSolver(IKSolverBase):
             self_collision_check=True,
             self_collision_opt=True,
             tensor_args=self.tensor_args,
+            use_cuda_graph=False,  # 禁用 CUDA Graph 以支持动态 batch size
         )
 
         self.ik_solver = IKSolver(ik_config)
