@@ -262,11 +262,15 @@ class CuroboIKSolver(IKSolverBase):
         # 创建 TensorDeviceType 对象
         self.tensor_args = TensorDeviceType(device=self.device, dtype=torch.float32)
 
+        # 加载配置文件为字典（避免 cuRobo 路径拼接问题）
+        robot_cfg_dict = self._load_config_file(arm_config.robot_config_file)
+        world_cfg_dict = self._load_config_file(arm_config.world_config_file)
+
         # 加载 IK 求解器配置
         # 注意: use_cuda_graph=False 避免 CUDA < 12.0 时的 Graph 重置问题
         ik_config = IKSolverConfig.load_from_robot_config(
-            arm_config.robot_config_file,
-            arm_config.world_config_file,
+            robot_cfg_dict,
+            world_cfg_dict,
             rotation_threshold=arm_config.rotation_threshold,
             position_threshold=arm_config.position_threshold,
             num_seeds=arm_config.num_seeds,
@@ -286,6 +290,20 @@ class CuroboIKSolver(IKSolverBase):
         print("[INFO] 预热 IK 求解器...")
         self._warmup()
         print("[INFO] 初始化完成")
+
+    def _load_config_file(self, config_path: str) -> dict:
+        """加载 YAML 配置文件为字典"""
+        import yaml
+        from pathlib import Path
+
+        path = Path(config_path)
+        if not path.exists():
+            raise FileNotFoundError(f"配置文件不存在: {config_path}")
+
+        with open(path, 'r') as f:
+            config = yaml.safe_load(f)
+
+        return config
 
     def _get_joint_limits(self) -> tuple[np.ndarray, np.ndarray]:
         """获取关节限位"""
