@@ -36,12 +36,12 @@ import torch
 # ===================================================================
 try:
     from curobo.types.math import Pose
-    from curobo.types.robot import JointState
+    from curobo.types.robot import JointState, RobotConfig
     from curobo.types.base import TensorDeviceType
     from curobo.cuda_robot_model.cuda_robot_model import CudaRobotModel
     from curobo.geom.sdf.world import WorldCollision
     from curobo.wrap.reacher.ik_solver import IKSolver, IKSolverConfig
-    from curobo.util_file import load_yaml, get_robot_configs_path
+    from curobo.util_file import load_yaml, get_robot_configs_path, join_path, get_robot_path
     CUROBO_AVAILABLE = True
 except ImportError:
     CUROBO_AVAILABLE = False
@@ -262,23 +262,87 @@ class CuroboIKSolver(IKSolverBase):
         # 创建 TensorDeviceType 对象
         self.tensor_args = TensorDeviceType(device=self.device, dtype=torch.float32)
 
-        # 加载配置文件为字典（避免 cuRobo 路径拼接问题）
-        robot_cfg_dict = self._load_config_file(arm_config.robot_config_file)
-        world_cfg_dict = self._load_config_file(arm_config.world_config_file)
+        # 加载机器人配置
+        from pathlib import Path
+        import yaml
 
-        # 加载 IK 求解器配置
-        # 注意: use_cuda_graph=False 避免 CUDA < 12.0 时的 Graph 重置问题
-        ik_config = IKSolverConfig.load_from_robot_config(
-            robot_cfg_dict,
-            world_cfg_dict,
-            rotation_threshold=arm_config.rotation_threshold,
-            position_threshold=arm_config.position_threshold,
-            num_seeds=arm_config.num_seeds,
-            self_collision_check=arm_config.self_collision_check,  # 自碰撞检测
-            self_collision_opt=arm_config.self_collision_opt,      # 自碰撞优化
-            tensor_args=self.tensor_args,
-            use_cuda_graph=False,  # 禁用 CUDA Graph 以支持动态 batch size
-        )
+        robot_cfg_path = Path(arm_config.robot_config_file).absolute()
+        print(f"[DEBUG] Loading robot config from: {robot_cfg_path}")
+
+        # 加载 YAML 配置
+        with open(robot_cfg_path, 'r') as f:
+            full_config = yaml.safe_load(f)
+
+        # 提取机器人配置的内层结构
+        robot_cfg_content = full_config.get('robot_cfg', full_config)
+
+        # 调试输出
+        print(f"[DEBUG] Robot config keys: {robot_cfg_content.keys()}")
+        if 'kinematics' in robot_cfg_content:
+            kin_cfg = robot_cfg_content['kinematics']
+            print(f"[DEBUG] Kinematics keys: {kin_cfg.keys()}")
+            if 'cspace' in kin_cfg:
+                cspace = kin_cfg['cspace']
+                print(f"[DEBUG] CSpace keys: {cspace.keys()}")
+                n_joints = len(cspace.get('joint_names', []))
+                print(f"[DEBUG] joint_names count: {n_joints}")
+                print(f"[DEBUG] cspace_distance_weight count: {len(cspace.get('cspace_distance_weight', []))}")
+
+        # 尝试使用 RobotConfig.from_dict 或类似方法
+        # 如果不可用，则使用 load_from_robot_config
+        try:
+            # 方法1: 尝试直接创建 RobotConfig
+            robot_config = RobotConfig.from_dict(robot_cfg_content, self.tensor_args)
+            print("[DEBUG] Successfully created RobotConfig from dict")
+
+            # 使用 RobotConfig 对象创建 IKSolverConfig
+            ik_config = IKSolverConfig.load_from_robot_config(
+                robot_config,
+                None,  # 无世界碰撞
+                rotation_threshold=arm_config.rotation_threshold,
+                position_threshold=arm_config.position_threshold,
+                num_seeds=arm_config.num_seeds,
+                self_collision_check=arm_config.self_collision_check,
+                self_collision_opt=arm_config.self_collision_opt,
+                tensor_args=self.tensor_args,
+                use_cuda_graph=False,
+            )
+        except (AttributeError, TypeError) as e:
+            print(f"[DEBUG] RobotConfig.from_dict not available: {e}")
+            print("[DEBUG] Trying alternative method...")
+
+            # 方法2: 使用 URDF 路径直接创建配置
+            # 从配置中获取 URDF 路径
+            urdf_path = robot_cfg_content['kinematics']['urdf_path']
+            base_link = robot_cfg_content['kinematics']['base_link']
+            ee_link = robot_cfg_content['kinematics']['ee_link']
+            cspace = robot_cfg_content['kinematics']['cspace']
+
+            # 构建 cuRobo 期望的格式
+            # 注意: load_from_robot_config 期望特定的字典结构
+            robot_dict = {
+                'kinematics': {
+                    'urdf_path': urdf_path,
+                    'base_link': base_link,
+                    'ee_link': ee_link,
+                    'cspace': cspace,
+                }
+            }
+
+            print(f"[DEBUG] Using URDF path: {urdf_path}")
+
+            # 世界配置：传递 None 禁用环境碰撞检测
+            ik_config = IKSolverConfig.load_from_robot_config(
+                robot_dict,
+                None,
+                rotation_threshold=arm_config.rotation_threshold,
+                position_threshold=arm_config.position_threshold,
+                num_seeds=arm_config.num_seeds,
+                self_collision_check=arm_config.self_collision_check,
+                self_collision_opt=arm_config.self_collision_opt,
+                tensor_args=self.tensor_args,
+                use_cuda_graph=False,
+            )
 
         self.ik_solver = IKSolver(ik_config)
 
@@ -290,20 +354,6 @@ class CuroboIKSolver(IKSolverBase):
         print("[INFO] 预热 IK 求解器...")
         self._warmup()
         print("[INFO] 初始化完成")
-
-    def _load_config_file(self, config_path: str) -> dict:
-        """加载 YAML 配置文件为字典"""
-        import yaml
-        from pathlib import Path
-
-        path = Path(config_path)
-        if not path.exists():
-            raise FileNotFoundError(f"配置文件不存在: {config_path}")
-
-        with open(path, 'r') as f:
-            config = yaml.safe_load(f)
-
-        return config
 
     def _get_joint_limits(self) -> tuple[np.ndarray, np.ndarray]:
         """获取关节限位"""

@@ -114,34 +114,45 @@ class URDFParser:
                 self.config.base_link = link_name
                 break
 
-        # 获取所有活动关节（非 fixed）
-        for joint_name, joint in robot.joint_map.items():
-            if joint.type in ['revolute', 'prismatic', 'continuous']:
-                self.config.joint_names.append(joint_name)
-                self.config.joint_types.append(joint.type)
-
-                # 关节限位
-                if joint.limit is not None:
-                    lower = joint.limit.lower if joint.limit.lower is not None else -3.14159
-                    upper = joint.limit.upper if joint.limit.upper is not None else 3.14159
-                    velocity = joint.limit.velocity if joint.limit.velocity is not None else 2.0
-                    effort = joint.limit.effort if joint.limit.effort is not None else 100.0
-                else:
-                    lower, upper = -3.14159, 3.14159
-                    velocity, effort = 2.0, 100.0
-
-                # continuous 关节没有限位
-                if joint.type == 'continuous':
-                    lower, upper = -6.28318, 6.28318
-
-                self.config.joint_limits_lower.append(lower)
-                self.config.joint_limits_upper.append(upper)
-                self.config.joint_velocity_limits.append(velocity)
-                self.config.joint_effort_limits.append(effort)
-
-        # 找到末端链接（运动链的最后一个链接）
-        # 简单方法：找到最深的链接
+        # 首先找到末端链接
         self.config.ee_link = self._find_ee_link(robot)
+
+        # 获取从 base_link 到 ee_link 的运动链中的关节（按顺序）
+        chain_joints = self._get_kinematic_chain_joints(robot)
+
+        if len(chain_joints) == 0:
+            # 如果无法找到链，则使用所有活动关节
+            print("[WARN] 无法确定运动链，使用所有活动关节")
+            # 收集所有活动关节
+            for joint_name, joint in robot.joint_map.items():
+                if joint.type in ['revolute', 'prismatic', 'continuous']:
+                    chain_joints.append(joint_name)
+
+        # 按运动链顺序添加关节
+        for joint_name in chain_joints:
+            joint = robot.joint_map[joint_name]
+
+            self.config.joint_names.append(joint_name)
+            self.config.joint_types.append(joint.type)
+
+            # 关节限位
+            if joint.limit is not None:
+                lower = joint.limit.lower if joint.limit.lower is not None else -3.14159
+                upper = joint.limit.upper if joint.limit.upper is not None else 3.14159
+                velocity = joint.limit.velocity if joint.limit.velocity is not None else 2.0
+                effort = joint.limit.effort if joint.limit.effort is not None else 100.0
+            else:
+                lower, upper = -3.14159, 3.14159
+                velocity, effort = 2.0, 100.0
+
+            # continuous 关节没有限位
+            if joint.type == 'continuous':
+                lower, upper = -6.28318, 6.28318
+
+            self.config.joint_limits_lower.append(lower)
+            self.config.joint_limits_upper.append(upper)
+            self.config.joint_velocity_limits.append(velocity)
+            self.config.joint_effort_limits.append(effort)
 
         # 默认关节位置（中间位置）
         self.config.default_joint_positions = [
@@ -159,6 +170,47 @@ class URDFParser:
         print(f"[INFO] 基座链接: {self.config.base_link}")
         print(f"[INFO] 末端链接: {self.config.ee_link}")
         print(f"[INFO] 活动关节数: {len(self.config.joint_names)}")
+
+    def _get_kinematic_chain_joints(self, robot) -> list:
+        """
+        获取从 base_link 到 ee_link 的运动链中的所有关节名称（按顺序）
+
+        Returns:
+            运动链中的关节名称列表（从基座到末端的顺序）
+        """
+        chain_joints = []
+
+        # 构建从子链接到父链接和关节的映射
+        child_to_parent = {}  # child_link -> (parent_link, joint_name, joint_type)
+        for joint_name, joint in robot.joint_map.items():
+            child_to_parent[joint.child] = (joint.parent, joint_name, joint.type)
+
+        # 从 ee_link 回溯到 base_link
+        current_link = self.config.ee_link
+        visited = set()
+
+        while current_link != self.config.base_link and current_link in child_to_parent:
+            if current_link in visited:
+                print(f"[WARN] 检测到循环，无法确定运动链")
+                break
+            visited.add(current_link)
+
+            parent_link, joint_name, joint_type = child_to_parent[current_link]
+
+            # 只包含活动关节
+            if joint_type in ['revolute', 'prismatic', 'continuous']:
+                chain_joints.append(joint_name)
+
+            current_link = parent_link
+
+        # 反转列表，使其从基座到末端
+        chain_joints.reverse()
+
+        print(f"[INFO] 运动链关节数: {len(chain_joints)}")
+        if len(chain_joints) > 0:
+            print(f"[INFO] 运动链关节: {chain_joints[:5]}{'...' if len(chain_joints) > 5 else ''}")
+
+        return chain_joints
 
     def _find_ee_link(self, robot) -> str:
         """找到末端执行器链接"""
@@ -269,23 +321,24 @@ class CuroboConfigGenerator:
         urdf_abs_path = str(Path(self.config.urdf_path).absolute())
         asset_root = str(Path(self.config.urdf_path).parent.absolute())
 
-        # cuRobo 期望的配置格式
+        n_joints = len(self.config.joint_names)
+        if n_joints == 0:
+            raise ValueError("没有找到活动关节，请检查 URDF 文件")
+
+        # cuRobo 期望的配置格式 - 注意结构
+        # 这个格式直接传给 IKSolverConfig.load_from_robot_config()
         robot_cfg = {
             'robot_cfg': {
                 'kinematics': {
-                    'usd_path': None,  # 我们使用 URDF，不使用 USD
                     'urdf_path': urdf_abs_path,
                     'asset_root_path': asset_root,
                     'base_link': self.config.base_link,
                     'ee_link': self.config.ee_link,
-                    'link_names': None,  # 让 cuRobo 从 URDF 自动获取
-                    'lock_joints': {},
-                    'extra_links': {},
                     'cspace': {
                         'joint_names': self.config.joint_names,
                         'retract_config': self.config.retract_config,
-                        'null_space_weight': [1.0] * len(self.config.joint_names),
-                        'cspace_distance_weight': [1.0] * len(self.config.joint_names),
+                        'null_space_weight': [1.0] * n_joints,
+                        'cspace_distance_weight': [1.0] * n_joints,
                         'max_jerk': 500.0,
                         'max_acceleration': 15.0,
                     },
@@ -316,9 +369,12 @@ class CuroboConfigGenerator:
         """生成 cuRobo 世界配置（无障碍物）"""
 
         # cuRobo 期望的世界配置格式 - 空世界
+        # 当传入字典时，可以直接传 None 或空的障碍物配置
         world_cfg = {
-            'cuboid': {},
-            'mesh': {},
+            'world_model': {
+                'cuboid': {},
+                'mesh': {},
+            }
         }
 
         if output_path:
