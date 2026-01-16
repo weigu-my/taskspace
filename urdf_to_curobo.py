@@ -88,7 +88,18 @@ class URDFParser:
         """使用 yourdfpy 解析"""
         robot = URDF.load(self.urdf_path)
 
-        self.config.robot_name = robot.name or self.urdf_path.stem
+        # 获取机器人名称 - yourdfpy 可能通过不同方式存储
+        try:
+            if hasattr(robot, 'name') and robot.name:
+                self.config.robot_name = robot.name
+            elif hasattr(robot, 'robot') and hasattr(robot.robot, 'name'):
+                self.config.robot_name = robot.robot.name
+            elif hasattr(robot, '_robot') and hasattr(robot._robot, 'attrib'):
+                self.config.robot_name = robot._robot.attrib.get('name', self.urdf_path.stem)
+            else:
+                self.config.robot_name = self.urdf_path.stem
+        except Exception:
+            self.config.robot_name = self.urdf_path.stem
 
         # 获取所有链接
         self.config.link_names = list(robot.link_map.keys())
