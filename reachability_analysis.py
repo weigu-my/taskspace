@@ -64,9 +64,17 @@ class OrientationMode(Enum):
 class ArmConfig:
     """单个机械臂的配置"""
     name: str                          # 臂的名称（如 "left_arm", "right_arm"）
-    ee_link: str                       # 末端执行器链接名
-    robot_config_file: str             # cuRobo 机器人配置文件
-    world_config_file: Optional[str] = None  # 世界/碰撞配置文件
+    ee_link: str = ""                  # 末端执行器链接名（可自动检测）
+
+    # 机器人模型配置（二选一）
+    # 方式1: 直接使用 URDF 文件（推荐，会自动转换为 cuRobo 配置）
+    urdf_path: Optional[str] = None
+    # 方式2: 使用已有的 cuRobo 配置文件
+    robot_config_file: Optional[str] = None
+    world_config_file: Optional[str] = None
+
+    # 基座链接（可选，自动检测）
+    base_link: str = ""
 
     # 工作空间边界（可选，若为 None 则自动估计）
     bbox: Optional[dict] = None        # {"x": (min, max), "y": (...), "z": (...)}
@@ -75,6 +83,10 @@ class ArmConfig:
     position_threshold: float = 0.005  # 位置阈值 (m)
     rotation_threshold: float = 0.05   # 旋转阈值 (rad)
     num_seeds: int = 32                # IK 初始种子数量
+
+    # 自碰撞检测
+    self_collision_check: bool = True  # 是否检测自碰撞
+    self_collision_opt: bool = True    # 是否优化避免自碰撞
 
 
 @dataclass
@@ -258,8 +270,8 @@ class CuroboIKSolver(IKSolverBase):
             rotation_threshold=arm_config.rotation_threshold,
             position_threshold=arm_config.position_threshold,
             num_seeds=arm_config.num_seeds,
-            self_collision_check=True,
-            self_collision_opt=True,
+            self_collision_check=arm_config.self_collision_check,  # 自碰撞检测
+            self_collision_opt=arm_config.self_collision_opt,      # 自碰撞优化
             tensor_args=self.tensor_args,
             use_cuda_graph=False,  # 禁用 CUDA Graph 以支持动态 batch size
         )
@@ -466,12 +478,52 @@ class ReachabilityAnalyzer:
 
         # 为每个臂初始化求解器
         for arm_cfg in config.arms:
-            if CUROBO_AVAILABLE:
+            # 如果提供了 URDF 路径，自动转换为 cuRobo 配置
+            if arm_cfg.urdf_path and not arm_cfg.robot_config_file:
+                arm_cfg = self._convert_urdf_to_curobo(arm_cfg)
+
+            if CUROBO_AVAILABLE and arm_cfg.robot_config_file:
                 self.solvers[arm_cfg.name] = CuroboIKSolver(arm_cfg)
             else:
                 # 使用模拟求解器
                 base_pos = np.array([0, 0.3, 0]) if "left" in arm_cfg.name.lower() else np.array([0, -0.3, 0])
                 self.solvers[arm_cfg.name] = DummyIKSolver(arm_cfg, base_position=base_pos)
+
+    def _convert_urdf_to_curobo(self, arm_cfg: ArmConfig) -> ArmConfig:
+        """将 URDF 转换为 cuRobo 配置"""
+        try:
+            from urdf_to_curobo import urdf_to_curobo_config, URDFParser
+
+            print(f"[INFO] 转换 URDF: {arm_cfg.urdf_path}")
+
+            # 解析 URDF 获取信息
+            parser = URDFParser(arm_cfg.urdf_path)
+
+            # 生成 cuRobo 配置
+            config_dir = os.path.join(self.config.output_dir, "curobo_configs")
+            robot_cfg_path, world_cfg_path = urdf_to_curobo_config(
+                arm_cfg.urdf_path,
+                ee_link=arm_cfg.ee_link or None,
+                base_link=arm_cfg.base_link or None,
+                output_dir=config_dir,
+            )
+
+            # 更新配置
+            arm_cfg.robot_config_file = robot_cfg_path
+            arm_cfg.world_config_file = world_cfg_path
+            if not arm_cfg.ee_link:
+                arm_cfg.ee_link = parser.config.ee_link
+            if not arm_cfg.base_link:
+                arm_cfg.base_link = parser.config.base_link
+
+            print(f"[INFO] cuRobo 配置已生成: {robot_cfg_path}")
+
+        except ImportError:
+            print("[ERROR] urdf_to_curobo 模块未找到，请确保 urdf_to_curobo.py 在同一目录")
+        except Exception as e:
+            print(f"[ERROR] URDF 转换失败: {e}")
+
+        return arm_cfg
 
     def _get_orientations(self, num_points: int) -> np.ndarray:
         """根据配置获取末端姿态"""
@@ -680,21 +732,75 @@ class ReachabilityAnalyzer:
 # 示例用法
 # ===================================================================
 
-def create_example_config() -> ReachabilityConfig:
-    """创建一个示例配置"""
+def create_config_from_urdf(
+    urdf_path: str,
+    arm_name: str = "robot_arm",
+    ee_link: str = "",
+    base_link: str = "",
+    bbox: dict = None,
+    voxel_size: float = 0.05,
+    num_dexterity_orientations: int = 12,
+) -> ReachabilityConfig:
+    """
+    从 URDF 文件创建可达性分析配置（推荐使用）
 
-    # 完整工作空间范围（每个臂都计算完整空间，不考虑互相碰撞）
+    Args:
+        urdf_path: URDF 文件路径
+        arm_name: 机械臂名称
+        ee_link: 末端执行器链接名（可选，自动检测）
+        base_link: 基座链接名（可选，自动检测）
+        bbox: 工作空间范围，如 {"x": (-1, 1), "y": (-1, 1), "z": (0, 1.5)}
+        voxel_size: 体素大小
+        num_dexterity_orientations: 灵巧性测试姿态数
+
+    Returns:
+        ReachabilityConfig 配置对象
+
+    示例:
+        config = create_config_from_urdf(
+            urdf_path="/path/to/robot.urdf",
+            ee_link="tool0",
+            bbox={"x": (-0.8, 0.8), "y": (-0.8, 0.8), "z": (0, 1.2)},
+        )
+    """
+    if bbox is None:
+        bbox = {"x": (-1.0, 1.0), "y": (-1.0, 1.0), "z": (0.0, 1.5)}
+
+    arm = ArmConfig(
+        name=arm_name,
+        urdf_path=urdf_path,        # 直接使用 URDF，自动转换为 cuRobo 配置
+        ee_link=ee_link,
+        base_link=base_link,
+        bbox=bbox,
+        self_collision_check=True,   # 启用自碰撞检测
+        self_collision_opt=True,
+    )
+
+    config = ReachabilityConfig(
+        arms=[arm],
+        voxel_size=voxel_size,
+        compute_dexterity=True,
+        num_dexterity_orientations=num_dexterity_orientations,
+        batch_size=1024,
+    )
+
+    return config
+
+
+def create_example_config() -> ReachabilityConfig:
+    """创建一个示例配置（使用 cuRobo 内置的 Franka）"""
+
+    # 完整工作空间范围
     full_bbox = {"x": (-0.9, 0.9), "y": (-0.9, 0.9), "z": (0.0, 1.3)}
 
-    # 单臂配置（使用 Franka Panda）
+    # 单臂配置（使用 cuRobo 内置的 Franka Panda 配置）
     single_arm = ArmConfig(
         name="franka_arm",
         ee_link="panda_hand",
-        robot_config_file="franka.yml",
+        robot_config_file="franka.yml",  # cuRobo 内置配置
         bbox=full_bbox,
-        position_threshold=0.005,
-        rotation_threshold=0.05,
-        num_seeds=32,
+        self_collision_check=True,
+        self_collision_opt=True,
     )
 
     # 全局配置
@@ -703,7 +809,7 @@ def create_example_config() -> ReachabilityConfig:
         voxel_size=0.05,
         orientation_mode=OrientationMode.FIXED,
         fixed_orientations=[
-            np.array([1.0, 0.0, 0.0, 0.0]),      # 单位四元数
+            np.array([1.0, 0.0, 0.0, 0.0]),
         ],
         batch_size=1024,
         output_dir="./reachability_output",
