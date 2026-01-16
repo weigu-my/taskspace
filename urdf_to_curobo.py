@@ -267,14 +267,20 @@ class CuroboConfigGenerator:
 
         # 获取 URDF 的绝对路径
         urdf_abs_path = str(Path(self.config.urdf_path).absolute())
+        asset_root = str(Path(self.config.urdf_path).parent.absolute())
 
+        # cuRobo 期望的配置格式
         robot_cfg = {
             'robot_cfg': {
                 'kinematics': {
+                    'usd_path': None,  # 我们使用 URDF，不使用 USD
                     'urdf_path': urdf_abs_path,
-                    'asset_root_path': str(Path(self.config.urdf_path).parent.absolute()),
+                    'asset_root_path': asset_root,
                     'base_link': self.config.base_link,
                     'ee_link': self.config.ee_link,
+                    'link_names': None,  # 让 cuRobo 从 URDF 自动获取
+                    'lock_joints': {},
+                    'extra_links': {},
                     'cspace': {
                         'joint_names': self.config.joint_names,
                         'retract_config': self.config.retract_config,
@@ -283,16 +289,6 @@ class CuroboConfigGenerator:
                         'max_jerk': 500.0,
                         'max_acceleration': 15.0,
                     },
-                },
-                'collision': {
-                    'self_collision_check': True,
-                    'self_collision_opt': True,
-                    # 生成碰撞球体配置
-                    'collision_spheres': self._generate_collision_spheres(),
-                    # 自碰撞忽略对
-                    'self_collision_ignore': {
-                        pair[0]: [pair[1]] for pair in self.config.self_collision_ignore
-                    } if self.config.self_collision_ignore else {},
                 },
             }
         }
@@ -319,13 +315,10 @@ class CuroboConfigGenerator:
     def generate_world_config(self, output_path: str = None) -> dict:
         """生成 cuRobo 世界配置（无障碍物）"""
 
+        # cuRobo 期望的世界配置格式 - 空世界
         world_cfg = {
-            'world_model': {
-                'world_collision': {
-                    'cube': {},
-                    'mesh': {},
-                },
-            }
+            'cuboid': {},
+            'mesh': {},
         }
 
         if output_path:
