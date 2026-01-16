@@ -276,6 +276,15 @@ class CuroboIKSolver(IKSolverBase):
         # 提取机器人配置的内层结构
         robot_cfg_content = full_config.get('robot_cfg', full_config)
 
+        world_cfg_content = None
+        if arm_config.world_config_file:
+            world_cfg_path = Path(arm_config.world_config_file).absolute()
+            if world_cfg_path.exists():
+                with open(world_cfg_path, 'r') as f:
+                    world_cfg_content = yaml.safe_load(f)
+            else:
+                print(f"[WARN] world config 不存在，忽略: {world_cfg_path}")
+
         # 调试输出
         print(f"[DEBUG] Robot config keys: {robot_cfg_content.keys()}")
         if 'kinematics' in robot_cfg_content:
@@ -298,7 +307,7 @@ class CuroboIKSolver(IKSolverBase):
             # 使用 RobotConfig 对象创建 IKSolverConfig
             ik_config = IKSolverConfig.load_from_robot_config(
                 robot_config,
-                None,  # 无世界碰撞
+                world_cfg_content,
                 rotation_threshold=arm_config.rotation_threshold,
                 position_threshold=arm_config.position_threshold,
                 num_seeds=arm_config.num_seeds,
@@ -317,6 +326,7 @@ class CuroboIKSolver(IKSolverBase):
             base_link = robot_cfg_content['kinematics']['base_link']
             ee_link = robot_cfg_content['kinematics']['ee_link']
             cspace = robot_cfg_content['kinematics']['cspace']
+            asset_root = robot_cfg_content['kinematics'].get('asset_root_path')
 
             # 构建 cuRobo 期望的格式
             # 注意: load_from_robot_config 期望特定的字典结构
@@ -328,13 +338,15 @@ class CuroboIKSolver(IKSolverBase):
                     'cspace': cspace,
                 }
             }
+            if asset_root:
+                robot_dict['kinematics']['asset_root_path'] = asset_root
 
             print(f"[DEBUG] Using URDF path: {urdf_path}")
 
             # 世界配置：传递 None 禁用环境碰撞检测
             ik_config = IKSolverConfig.load_from_robot_config(
                 robot_dict,
-                None,
+                world_cfg_content,
                 rotation_threshold=arm_config.rotation_threshold,
                 position_threshold=arm_config.position_threshold,
                 num_seeds=arm_config.num_seeds,

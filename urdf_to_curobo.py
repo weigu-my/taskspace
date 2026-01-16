@@ -231,6 +231,11 @@ class URDFParser:
                     return link
 
         # 否则返回第一个叶子链接
+        if len(leaf_links) > 1:
+            print(
+                "[WARN] 未找到包含关键字的末端链接，自动选择首个叶子链接。"
+                "建议显式指定 ee_link 以避免选错。"
+            )
         return leaf_links[0] if leaf_links else self.config.link_names[-1]
 
     def _generate_collision_ignore_pairs(self, robot):
@@ -296,7 +301,26 @@ class URDFParser:
                 break
 
         # 默认末端链接
-        self.config.ee_link = self.config.link_names[-1]
+        if self.config.link_names:
+            # 计算叶子链接并选择末端
+            children = {link: [] for link in self.config.link_names}
+            for joint in root.findall('joint'):
+                parent = joint.find('parent')
+                child = joint.find('child')
+                if parent is not None and child is not None:
+                    parent_link = parent.get('link')
+                    child_link = child.get('link')
+                    if parent_link in children:
+                        children[parent_link].append(child_link)
+            leaf_links = [link for link, childs in children.items() if len(childs) == 0]
+            if len(leaf_links) > 1:
+                print(
+                    "[WARN] XML 解析未匹配到末端关键字，自动选择首个叶子链接。"
+                    "建议显式指定 ee_link。"
+                )
+            self.config.ee_link = leaf_links[0] if leaf_links else self.config.link_names[-1]
+        else:
+            self.config.ee_link = ""
 
         # 默认关节位置
         self.config.default_joint_positions = [
