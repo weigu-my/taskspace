@@ -88,6 +88,9 @@ class ArmConfig:
     self_collision_check: bool = True  # 是否检测自碰撞
     self_collision_opt: bool = True    # 是否优化避免自碰撞
 
+    # 双臂机器人选择
+    arm_select: str = "auto"           # "left", "right", 或 "auto"
+
 
 @dataclass
 class ReachabilityConfig:
@@ -564,16 +567,22 @@ class ReachabilityAnalyzer:
 
             print(f"[INFO] 转换 URDF: {arm_cfg.urdf_path}")
 
-            # 解析 URDF 获取信息
-            parser = URDFParser(arm_cfg.urdf_path)
-
-            # 生成 cuRobo 配置
+            # 生成 cuRobo 配置（传入手臂选择参数）
             config_dir = os.path.join(self.config.output_dir, "curobo_configs")
             robot_cfg_path, world_cfg_path = urdf_to_curobo_config(
                 arm_cfg.urdf_path,
                 ee_link=arm_cfg.ee_link or None,
                 base_link=arm_cfg.base_link or None,
                 output_dir=config_dir,
+                arm_select=arm_cfg.arm_select,
+            )
+
+            # 解析 URDF 获取实际使用的链接信息
+            parser = URDFParser(
+                arm_cfg.urdf_path,
+                ee_link=arm_cfg.ee_link or None,
+                base_link=arm_cfg.base_link or None,
+                arm_select=arm_cfg.arm_select
             )
 
             # 更新配置
@@ -589,7 +598,9 @@ class ReachabilityAnalyzer:
         except ImportError:
             print("[ERROR] urdf_to_curobo 模块未找到，请确保 urdf_to_curobo.py 在同一目录")
         except Exception as e:
+            import traceback
             print(f"[ERROR] URDF 转换失败: {e}")
+            traceback.print_exc()
 
         return arm_cfg
 
@@ -808,6 +819,7 @@ def create_config_from_urdf(
     bbox: dict = None,
     voxel_size: float = 0.05,
     num_dexterity_orientations: int = 12,
+    arm_select: str = "auto",
 ) -> ReachabilityConfig:
     """
     从 URDF 文件创建可达性分析配置（推荐使用）
@@ -820,6 +832,7 @@ def create_config_from_urdf(
         bbox: 工作空间范围，如 {"x": (-1, 1), "y": (-1, 1), "z": (0, 1.5)}
         voxel_size: 体素大小
         num_dexterity_orientations: 灵巧性测试姿态数
+        arm_select: 双臂机器人选择 "left", "right", 或 "auto"
 
     Returns:
         ReachabilityConfig 配置对象
@@ -829,6 +842,7 @@ def create_config_from_urdf(
             urdf_path="/path/to/robot.urdf",
             ee_link="tool0",
             bbox={"x": (-0.8, 0.8), "y": (-0.8, 0.8), "z": (0, 1.2)},
+            arm_select="left",  # 分析左臂
         )
     """
     if bbox is None:
@@ -842,6 +856,7 @@ def create_config_from_urdf(
         bbox=bbox,
         self_collision_check=True,   # 启用自碰撞检测
         self_collision_opt=True,
+        arm_select=arm_select,       # 双臂机器人选择
     )
 
     config = ReachabilityConfig(
@@ -973,6 +988,13 @@ def main():
         help="基座链接名 (默认: 自动检测)"
     )
     parser.add_argument(
+        "--arm",
+        type=str,
+        choices=["left", "right", "L", "R", "auto"],
+        default="auto",
+        help="双臂机器人选择哪个手臂 (left/right/auto) (默认: auto)"
+    )
+    parser.add_argument(
         "--voxel-size", "-v",
         type=float,
         default=0.05,
@@ -1048,6 +1070,7 @@ def main():
     print(f"[INFO] URDF 文件: {urdf_path.absolute()}")
     print(f"[INFO] 末端链接: {args.ee_link or '自动检测'}")
     print(f"[INFO] 基座链接: {args.base_link or '自动检测'}")
+    print(f"[INFO] 手臂选择: {args.arm}")
     print(f"[INFO] 体素大小: {args.voxel_size}m")
     print(f"[INFO] 灵巧性测试姿态数: {args.num_orientations}")
     print(f"[INFO] 输出目录: {args.output_dir}")
@@ -1061,6 +1084,7 @@ def main():
         bbox=bbox,
         voxel_size=args.voxel_size,
         num_dexterity_orientations=args.num_orientations,
+        arm_select=args.arm,
     )
 
     # 更新配置

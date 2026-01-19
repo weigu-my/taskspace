@@ -69,12 +69,24 @@ class URDFRobotConfig:
 class URDFParser:
     """URDF 解析器"""
 
-    def __init__(self, urdf_path: str):
+    def __init__(self, urdf_path: str, ee_link: str = None, base_link: str = None, arm_select: str = "auto"):
+        """
+        初始化 URDF 解析器
+
+        Args:
+            urdf_path: URDF 文件路径
+            ee_link: 指定的末端执行器链接（可选）
+            base_link: 指定的基座链接（可选）
+            arm_select: 对于双臂机器人，选择 "left", "right", 或 "auto"
+        """
         self.urdf_path = Path(urdf_path)
         if not self.urdf_path.exists():
             raise FileNotFoundError(f"URDF 文件不存在: {urdf_path}")
 
         self.config = URDFRobotConfig(urdf_path=str(urdf_path))
+        self.specified_ee_link = ee_link
+        self.specified_base_link = base_link
+        self.arm_select = arm_select.lower() if arm_select else "auto"
         self._parse()
 
     def _parse(self):
@@ -104,25 +116,47 @@ class URDFParser:
         # 获取所有链接
         self.config.link_names = list(robot.link_map.keys())
 
-        # 找到基座链接（没有父关节的链接）
+        # 找到根链接（没有父关节的链接）
         child_links = set()
         for joint in robot.joint_map.values():
             child_links.add(joint.child)
 
+        root_link = None
         for link_name in self.config.link_names:
             if link_name not in child_links:
-                self.config.base_link = link_name
+                root_link = link_name
                 break
 
-        # 首先找到末端链接
-        self.config.ee_link = self._find_ee_link(robot)
+        # 设置末端链接（优先使用指定的，否则自动检测）
+        if self.specified_ee_link:
+            if self.specified_ee_link in self.config.link_names:
+                self.config.ee_link = self.specified_ee_link
+                print(f"[INFO] 使用指定的末端链接: {self.specified_ee_link}")
+            else:
+                print(f"[WARN] 指定的末端链接 '{self.specified_ee_link}' 不存在，将自动检测")
+                self.config.ee_link = self._find_ee_link(robot)
+        else:
+            self.config.ee_link = self._find_ee_link(robot)
 
-        # 获取从 base_link 到 ee_link 的运动链中的关节（按顺序）
-        chain_joints = self._get_kinematic_chain_joints(robot)
+        # 找到从末端到根的运动链，并确定合适的基座链接
+        chain_joints, chain_base_link = self._get_kinematic_chain_with_base(robot, root_link)
+
+        # 设置基座链接（优先使用指定的，否则使用运动链的起点）
+        if self.specified_base_link:
+            if self.specified_base_link in self.config.link_names:
+                self.config.base_link = self.specified_base_link
+                print(f"[INFO] 使用指定的基座链接: {self.specified_base_link}")
+            else:
+                print(f"[WARN] 指定的基座链接 '{self.specified_base_link}' 不存在，将自动检测")
+                self.config.base_link = chain_base_link if chain_base_link else root_link
+        else:
+            self.config.base_link = chain_base_link if chain_base_link else root_link
 
         if len(chain_joints) == 0:
             # 如果无法找到链，则使用所有活动关节
             print("[WARN] 无法确定运动链，使用所有活动关节")
+            if not self.specified_base_link:
+                self.config.base_link = root_link
             # 收集所有活动关节
             for joint_name, joint in robot.joint_map.items():
                 if joint.type in ['revolute', 'prismatic', 'continuous']:
@@ -171,45 +205,69 @@ class URDFParser:
         print(f"[INFO] 末端链接: {self.config.ee_link}")
         print(f"[INFO] 活动关节数: {len(self.config.joint_names)}")
 
-    def _get_kinematic_chain_joints(self, robot) -> list:
+    def _get_kinematic_chain_with_base(self, robot, root_link: str) -> tuple:
         """
-        获取从 base_link 到 ee_link 的运动链中的所有关节名称（按顺序）
+        获取从末端到根的运动链，并找到合适的基座链接
+
+        Args:
+            robot: URDF 机器人对象
+            root_link: 根链接名称
 
         Returns:
-            运动链中的关节名称列表（从基座到末端的顺序）
+            (chain_joints, base_link): 运动链关节列表和基座链接名
         """
         chain_joints = []
+        chain_links = []  # 记录链路中的所有链接
 
         # 构建从子链接到父链接和关节的映射
         child_to_parent = {}  # child_link -> (parent_link, joint_name, joint_type)
         for joint_name, joint in robot.joint_map.items():
             child_to_parent[joint.child] = (joint.parent, joint_name, joint.type)
 
-        # 从 ee_link 回溯到 base_link
+        # 从 ee_link 回溯到根链接
         current_link = self.config.ee_link
         visited = set()
+        first_active_joint_parent = None
 
-        while current_link != self.config.base_link and current_link in child_to_parent:
+        while current_link in child_to_parent:
             if current_link in visited:
                 print(f"[WARN] 检测到循环，无法确定运动链")
                 break
             visited.add(current_link)
 
             parent_link, joint_name, joint_type = child_to_parent[current_link]
+            chain_links.append(current_link)
 
             # 只包含活动关节
             if joint_type in ['revolute', 'prismatic', 'continuous']:
                 chain_joints.append(joint_name)
+                # 记录第一个活动关节的父链接作为基座
+                first_active_joint_parent = parent_link
 
             current_link = parent_link
 
         # 反转列表，使其从基座到末端
         chain_joints.reverse()
 
+        # 基座链接是第一个活动关节的父链接
+        base_link = first_active_joint_parent if first_active_joint_parent else root_link
+
         print(f"[INFO] 运动链关节数: {len(chain_joints)}")
         if len(chain_joints) > 0:
             print(f"[INFO] 运动链关节: {chain_joints[:5]}{'...' if len(chain_joints) > 5 else ''}")
+            print(f"[INFO] 运动链基座: {base_link}")
 
+        return chain_joints, base_link
+
+    def _get_kinematic_chain_joints(self, robot) -> list:
+        """
+        获取从 base_link 到 ee_link 的运动链中的所有关节名称（按顺序）
+        （保留此方法以保持兼容性）
+
+        Returns:
+            运动链中的关节名称列表（从基座到末端的顺序）
+        """
+        chain_joints, _ = self._get_kinematic_chain_with_base(robot, self.config.base_link)
         return chain_joints
 
     def _find_ee_link(self, robot) -> str:
@@ -223,15 +281,107 @@ class URDFParser:
         # 找到没有子链接的链接（叶子节点）
         leaf_links = [link for link, childs in children.items() if len(childs) == 0]
 
-        # 优先选择名称中包含 'ee', 'end', 'tool', 'gripper', 'hand' 的链接
-        ee_keywords = ['ee', 'end', 'tool', 'gripper', 'hand', 'tcp', 'flange']
-        for link in leaf_links:
-            for keyword in ee_keywords:
-                if keyword in link.lower():
-                    return link
+        # 计算每个叶子链接的运动链深度（活动关节数量）
+        def get_chain_depth(link_name):
+            """计算从基座到指定链接的活动关节数量"""
+            depth = 0
+            current = link_name
+            child_to_parent = {}
+            for joint_name, joint in robot.joint_map.items():
+                child_to_parent[joint.child] = (joint.parent, joint.type)
 
-        # 否则返回第一个叶子链接
-        return leaf_links[0] if leaf_links else self.config.link_names[-1]
+            visited = set()
+            while current in child_to_parent and current not in visited:
+                visited.add(current)
+                parent, joint_type = child_to_parent[current]
+                if joint_type in ['revolute', 'prismatic', 'continuous']:
+                    depth += 1
+                current = parent
+            return depth
+
+        # 优先选择机械臂相关的末端链接
+        # 关键词优先级：gripper/hand > flange/tool > ee/end/tcp
+        arm_keywords_high = ['gripper', 'hand', 'finger', 'pad']
+        arm_keywords_mid = ['flange', 'tool', 'end_effector']
+        arm_keywords_low = ['ee', 'end', 'tcp', 'link7', 'link6']
+
+        # 排除轮子和底盘相关的链接
+        exclude_keywords = ['wheel', 'chassis', 'caster', 'base_footprint']
+
+        # 根据手臂选择过滤
+        arm_filter_keywords = []
+        opposite_arm_keywords = []
+        if self.arm_select in ['left', 'l']:
+            arm_filter_keywords = ['left', '_l_', '_l/', '/l_', 'l_arm', 'larm', '_l.']
+            opposite_arm_keywords = ['right', '_r_', '_r/', '/r_', 'r_arm', 'rarm', '_r.']
+            print(f"[INFO] 选择左臂进行分析")
+        elif self.arm_select in ['right', 'r']:
+            arm_filter_keywords = ['right', '_r_', '_r/', '/r_', 'r_arm', 'rarm', '_r.']
+            opposite_arm_keywords = ['left', '_l_', '_l/', '/l_', 'l_arm', 'larm', '_l.']
+            print(f"[INFO] 选择右臂进行分析")
+
+        # 筛选候选链接（排除底盘相关，根据手臂选择过滤）
+        candidate_links = []
+        for link in leaf_links:
+            link_lower = link.lower()
+            is_excluded = any(kw in link_lower for kw in exclude_keywords)
+
+            # 如果指定了手臂，排除另一只手臂的链接
+            if opposite_arm_keywords:
+                is_opposite_arm = any(kw in link_lower for kw in opposite_arm_keywords)
+                if is_opposite_arm:
+                    is_excluded = True
+
+            if not is_excluded:
+                depth = get_chain_depth(link)
+                # 如果指定了手臂，优先选择匹配的链接
+                is_matching_arm = any(kw in link_lower for kw in arm_filter_keywords) if arm_filter_keywords else False
+                candidate_links.append((link, depth, is_matching_arm))
+
+        # 按深度和是否匹配手臂排序（优先匹配手臂，其次深度）
+        candidate_links.sort(key=lambda x: (x[2], x[1]), reverse=True)
+
+        # 在深度足够的候选中，按关键词优先级选择
+        for link, depth, is_matching in candidate_links:
+            if depth >= 5:  # 至少 5 个活动关节才可能是机械臂
+                link_lower = link.lower()
+                for keyword in arm_keywords_high:
+                    if keyword in link_lower:
+                        print(f"[INFO] 自动检测到末端链接: {link} (深度={depth}, 关键词={keyword})")
+                        return link
+
+        for link, depth, is_matching in candidate_links:
+            if depth >= 5:
+                link_lower = link.lower()
+                for keyword in arm_keywords_mid:
+                    if keyword in link_lower:
+                        print(f"[INFO] 自动检测到末端链接: {link} (深度={depth}, 关键词={keyword})")
+                        return link
+
+        for link, depth, is_matching in candidate_links:
+            if depth >= 5:
+                link_lower = link.lower()
+                for keyword in arm_keywords_low:
+                    if keyword in link_lower:
+                        print(f"[INFO] 自动检测到末端链接: {link} (深度={depth}, 关键词={keyword})")
+                        return link
+
+        # 如果没有匹配关键词，选择深度最大的候选
+        if candidate_links:
+            best_link, best_depth, _ = candidate_links[0]
+            if best_depth >= 3:
+                print(f"[INFO] 自动检测到末端链接: {best_link} (深度={best_depth})")
+                return best_link
+
+        # 最后备选：原始叶子节点中深度最大的
+        all_with_depth = [(link, get_chain_depth(link)) for link in leaf_links]
+        all_with_depth.sort(key=lambda x: x[1], reverse=True)
+        if all_with_depth:
+            best_link, best_depth = all_with_depth[0]
+            print(f"[WARN] 使用备选末端链接: {best_link} (深度={best_depth})")
+            return best_link
+
+        return self.config.link_names[-1]
 
     def _generate_collision_ignore_pairs(self, robot):
         """生成自碰撞忽略对（相邻链接不检测碰撞）"""
@@ -405,6 +555,7 @@ def urdf_to_curobo_config(
     ee_link: str = None,
     base_link: str = None,
     output_dir: str = "./curobo_configs",
+    arm_select: str = "auto",
 ) -> tuple[str, str]:
     """
     将 URDF 文件转换为 cuRobo 配置
@@ -414,18 +565,13 @@ def urdf_to_curobo_config(
         ee_link: 末端执行器链接名（可选，自动检测）
         base_link: 基座链接名（可选，自动检测）
         output_dir: 输出目录
+        arm_select: 对于双臂机器人，选择 "left", "right", 或 "auto"
 
     Returns:
         (robot_config_path, world_config_path)
     """
-    # 解析 URDF
-    parser = URDFParser(urdf_path)
-
-    # 覆盖用户指定的链接
-    if ee_link:
-        parser.config.ee_link = ee_link
-    if base_link:
-        parser.config.base_link = base_link
+    # 解析 URDF（传入用户指定的参数）
+    parser = URDFParser(urdf_path, ee_link=ee_link, base_link=base_link, arm_select=arm_select)
 
     # 生成配置
     generator = CuroboConfigGenerator(parser.config)
