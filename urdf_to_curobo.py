@@ -68,6 +68,18 @@ def _build_generator(module):
     return None
 
 
+def _load_xrdf_module():
+    """加载 cuRobo XRDF 模块（兼容不同版本）。"""
+    module_candidates = [
+        "curobo.util.xrdf_generator",
+        "curobo.util.xrdf_utils",
+    ]
+    for module_name in module_candidates:
+        if importlib.util.find_spec(module_name) is not None:
+            return importlib.import_module(module_name)
+    return None
+
+
 def convert_urdf_to_xrdf(
     urdf_path: str,
     xrdf_path: str,
@@ -78,10 +90,9 @@ def convert_urdf_to_xrdf(
     urdf_path = str(Path(urdf_path).expanduser().resolve())
     xrdf_path = str(Path(xrdf_path).expanduser().resolve())
 
-    if importlib.util.find_spec("curobo.util.xrdf_generator") is None:
-        raise XRDFConversionError("未找到 cuRobo，请先安装 curobo")
-
-    module = importlib.import_module("curobo.util.xrdf_generator")
+    module = _load_xrdf_module()
+    if module is None:
+        raise XRDFConversionError("未找到 cuRobo XRDF 模块，请先安装 curobo")
 
     generator = _build_generator(module)
     if generator is None:
