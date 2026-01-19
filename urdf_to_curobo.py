@@ -36,6 +36,7 @@ class XRDFConversionError(RuntimeError):
 
 def _call_with_supported_args(callable_obj: Callable, **kwargs):
     """根据签名过滤参数后调用。"""
+    # 只保留目标函数支持且非空的参数，避免因为版本差异导致参数不匹配报错
     signature = inspect.signature(callable_obj)
     supported = {
         name: value
@@ -47,6 +48,7 @@ def _call_with_supported_args(callable_obj: Callable, **kwargs):
 
 def _build_generator(module):
     """从 cuRobo 模块中解析 XRDF 生成器。"""
+    # 不同版本的 cuRobo 可能提供不同名称的函数或类，逐个探测
     candidate_funcs = [
         "generate_xrdf_from_urdf",
         "urdf_to_xrdf",
@@ -70,9 +72,11 @@ def _build_generator(module):
 
 
 def _load_xrdf_module() -> object:
+    # 先判断 cuRobo 是否已安装，避免误报
     if importlib.util.find_spec("curobo") is None:
         raise XRDFConversionError("未找到 cuRobo，请先安装 curobo")
 
+    # 先尝试常见模块名
     candidate_modules = [
         "curobo.util.xrdf_generator",
         "curobo.util.xrdf_utils",
@@ -82,6 +86,7 @@ def _load_xrdf_module() -> object:
         if importlib.util.find_spec(module_name) is not None:
             return importlib.import_module(module_name)
 
+    # 如果常见路径不存在，再扫描 cuRobo 包内是否存在包含 xrdf 的模块
     import curobo
 
     xrdf_modules = [
@@ -95,6 +100,7 @@ def _load_xrdf_module() -> object:
         except ImportError:
             continue
 
+    # 走到这里说明 cuRobo 已安装，但版本中没有 XRDF 生成器
     raise XRDFConversionError("已安装 cuRobo，但未找到 XRDF 生成器模块")
 
 
@@ -105,16 +111,20 @@ def convert_urdf_to_xrdf(
     ee_link: Optional[str] = None,
 ) -> XRDFConversionResult:
     """将 URDF 转换为 XRDF。"""
+    # 统一为绝对路径，避免相对路径引发的资源查找问题
     urdf_path = str(Path(urdf_path).expanduser().resolve())
     xrdf_path = str(Path(xrdf_path).expanduser().resolve())
 
+    # 获取 XRDF 生成器模块
     module = _load_xrdf_module()
 
     generator = _build_generator(module)
+    # 若没有找到生成器，直接报错提示
     if generator is None:
         raise XRDFConversionError("无法在 cuRobo 中找到 XRDF 生成器")
 
     if inspect.isclass(generator):
+        # 若生成器是类，则初始化后调用 save/write
         instance = _call_with_supported_args(
             generator,
             urdf_path=urdf_path,
@@ -122,12 +132,14 @@ def convert_urdf_to_xrdf(
             ee_link=ee_link,
         )
         if hasattr(instance, "save"):
+            # 兼容不同版本的参数命名
             _call_with_supported_args(instance.save, xrdf_path=xrdf_path, output_path=xrdf_path)
         elif hasattr(instance, "write"):
             _call_with_supported_args(instance.write, xrdf_path=xrdf_path, output_path=xrdf_path)
         else:
             raise XRDFConversionError("XRDF 生成器没有 save/write 方法")
     else:
+        # 若生成器是函数，则直接调用
         _call_with_supported_args(
             generator,
             urdf_path=urdf_path,
@@ -137,6 +149,7 @@ def convert_urdf_to_xrdf(
             ee_link=ee_link,
         )
 
+    # 检查输出文件是否生成
     if not Path(xrdf_path).exists():
         raise XRDFConversionError("XRDF 文件未生成，请检查 cuRobo 输出")
 
