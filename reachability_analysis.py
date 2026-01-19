@@ -6,7 +6,7 @@ cuRobo 机械臂可达性分析（GPU + 多种指标）
 ===========================================================
 
 功能:
-1. 使用 cuRobo 的 XRDF 配置（URDF -> XRDF）
+1. 使用 cuRobo 的 XRDF 配置（直接使用 XRDF）
 2. 体素化空间 + GPU IK 批量求解
 3. 多 seeds IK 统计解的数量
 4. 计算 dexterity（可达姿态数）
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -26,8 +26,6 @@ import importlib.util
 import inspect
 import numpy as np
 import torch
-
-from urdf_to_curobo import convert_urdf_to_xrdf
 
 if importlib.util.find_spec("curobo") is None:
     CUROBO_AVAILABLE = False
@@ -43,10 +41,7 @@ else:
 @dataclass
 class ArmConfig:
     name: str
-    urdf_path: str
-    xrdf_path: Optional[str] = None
-    base_link: Optional[str] = None
-    ee_link: Optional[str] = None
+    xrdf_path: str
     num_seeds: int = 32
     position_threshold: float = 0.005
     rotation_threshold: float = 0.05
@@ -200,15 +195,8 @@ class ReachabilityAnalyzer:
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
         self.arm = config.arm
-        if self.arm.xrdf_path is None:
-            xrdf_path = self.output_dir / f"{self.arm.name}.xrdf"
-            convert_urdf_to_xrdf(
-                self.arm.urdf_path,
-                str(xrdf_path),
-                base_link=self.arm.base_link,
-                ee_link=self.arm.ee_link,
-            )
-            self.arm.xrdf_path = str(xrdf_path)
+        if not self.arm.xrdf_path:
+            raise RuntimeError("需要提供 XRDF 路径进行可达性分析")
 
         self.solver = CuroboMultiSeedIK(self.arm, self.device)
 
@@ -354,9 +342,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="cuRobo 可达性分析")
-    parser.add_argument("--urdf", required=True, help="URDF 路径")
-    parser.add_argument("--ee-link", default=None, help="末端执行器链接")
-    parser.add_argument("--base-link", default=None, help="基座链接")
+    parser.add_argument("--xrdf", required=True, help="XRDF 路径")
     parser.add_argument("--voxel-size", type=float, default=0.05, help="体素大小")
     parser.add_argument("--num-orientations", type=int, default=12, help="姿态采样数")
     parser.add_argument("--num-seeds", type=int, default=32, help="IK seeds 数量")
@@ -382,9 +368,7 @@ def main():
 
     arm = ArmConfig(
         name="robot_arm",
-        urdf_path=args.urdf,
-        base_link=args.base_link,
-        ee_link=args.ee_link,
+        xrdf_path=args.xrdf,
         num_seeds=args.num_seeds,
     )
 

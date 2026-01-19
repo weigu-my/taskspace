@@ -2,9 +2,9 @@
 
 ## 机械臂可达性分析通用框架（cuRobo + GPU）
 
-本项目提供一套从 **URDF → XRDF → GPU IK → 可达性分析 → 可视化** 的完整流程，满足以下需求：
+本项目提供一套从 **XRDF → GPU IK → 可达性分析 → 可视化** 的完整流程，满足以下需求：
 
-1. 使用 cuRobo 将任意 URDF 转换为 XRDF。
+1. 直接使用 XRDF 进行可达性分析。
 2. 使用体素划分 + GPU IK 批量求解进行可达性分析。
 3. 支持多 seeds IK，统计每个体素点的解的数量。
 4. 计算 dexterity 与 Yoshikawa manipulability。
@@ -12,22 +12,11 @@
 
 ---
 
-## 1. URDF → XRDF
-
-```bash
-python urdf_to_curobo.py /path/to/robot.urdf -o /path/to/robot.xrdf \
-  --base-link base_link --ee-link tool0
-```
-
----
-
-## 2. 可达性分析（GPU IK + 多种指标）
+## 1. 可达性分析（GPU IK + 多种指标）
 
 ```bash
 python reachability_analysis.py \
-  --urdf /path/to/robot.urdf \
-  --ee-link tool0 \
-  --base-link base_link \
+  --xrdf /path/to/robot.xrdf \
   --voxel-size 0.05 \
   --num-orientations 16 \
   --num-seeds 64 \
@@ -49,7 +38,7 @@ x,y,z,dexterity,solution_count,manipulability
 
 ---
 
-## 3. 可视化（URDF + 点云）
+## 2. 可视化（URDF + 点云）
 
 ```bash
 python visualize_with_robot.py \
