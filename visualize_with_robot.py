@@ -109,9 +109,20 @@ def transform_mesh(vertices: np.ndarray, transform: np.ndarray) -> np.ndarray:
 class URDFMeshLoader:
     """从 URDF 加载机械臂网格模型"""
 
-    def __init__(self, urdf_path: str):
+    def __init__(self, urdf_path: str, package_paths: Dict[str, str] = None):
+        """
+        初始化 URDF 网格加载器
+
+        Args:
+            urdf_path: URDF 文件路径
+            package_paths: ROS 包名到路径的映射，如 {"robot_model": "/path/to/robot_model"}
+        """
         self.urdf_path = Path(urdf_path)
         self.urdf_dir = self.urdf_path.parent
+        self.package_paths = package_paths or {}
+
+        # 自动检测常见的包路径
+        self._auto_detect_package_paths()
 
         # 解析 URDF
         self.tree = ET.parse(urdf_path)
@@ -123,6 +134,42 @@ class URDFMeshLoader:
         self.link_meshes = {}
 
         self._parse_urdf()
+
+    def _auto_detect_package_paths(self):
+        """自动检测常见的 ROS 包路径"""
+        # 检查 URDF 目录的父目录结构
+        # 常见结构：workspace/src/package_name/urdf/robot.urdf
+        #         或：package_name/urdf/robot.urdf
+
+        # 检查是否有 meshes 目录在同级或父级
+        search_dirs = [
+            self.urdf_dir,
+            self.urdf_dir.parent,
+            self.urdf_dir.parent.parent,
+        ]
+
+        for search_dir in search_dirs:
+            if not search_dir.exists():
+                continue
+
+            # 查找包含 meshes 目录的文件夹
+            for item in search_dir.iterdir():
+                if item.is_dir():
+                    meshes_dir = item / "meshes"
+                    if meshes_dir.exists():
+                        package_name = item.name
+                        if package_name not in self.package_paths:
+                            self.package_paths[package_name] = str(item)
+                            print(f"[INFO] 自动检测到包路径: {package_name} -> {item}")
+
+            # 也检查当前目录是否直接包含 meshes
+            meshes_dir = search_dir / "meshes"
+            if meshes_dir.exists():
+                # 使用父目录名作为包名
+                package_name = search_dir.name
+                if package_name not in self.package_paths:
+                    self.package_paths[package_name] = str(search_dir)
+                    print(f"[INFO] 自动检测到包路径: {package_name} -> {search_dir}")
 
     def _parse_urdf(self):
         """解析 URDF 文件"""
@@ -219,19 +266,38 @@ class URDFMeshLoader:
             if filename:
                 # 处理 package:// 路径
                 if filename.startswith('package://'):
-                    # 尝试在 urdf 目录及其父目录中查找
+                    # 解析 package://package_name/path/to/file
                     package_path = filename.replace('package://', '')
-                    possible_paths = [
-                        self.urdf_dir / package_path,
-                        self.urdf_dir.parent / package_path,
-                        self.urdf_dir / package_path.split('/', 1)[-1] if '/' in package_path else None,
-                    ]
-                    for p in possible_paths:
-                        if p and p.exists():
-                            result['mesh_path'] = str(p)
-                            break
+                    parts = package_path.split('/', 1)
+                    package_name = parts[0]
+                    relative_path = parts[1] if len(parts) > 1 else ''
+
+                    # 首先检查是否有已知的包路径
+                    if package_name in self.package_paths:
+                        resolved_path = Path(self.package_paths[package_name]) / relative_path
+                        if resolved_path.exists():
+                            result['mesh_path'] = str(resolved_path)
+
+                    # 如果没有找到，尝试其他可能的路径
                     if not result['mesh_path']:
+                        possible_paths = [
+                            self.urdf_dir / package_path,
+                            self.urdf_dir / relative_path,
+                            self.urdf_dir.parent / package_path,
+                            self.urdf_dir.parent / relative_path,
+                            self.urdf_dir.parent / package_name / relative_path,
+                        ]
+                        for p in possible_paths:
+                            if p and p.exists():
+                                result['mesh_path'] = str(p)
+                                break
+
+                    if not result['mesh_path']:
+                        # 最后使用默认路径（可能不存在）
                         result['mesh_path'] = str(self.urdf_dir / package_path)
+
+                elif filename.startswith('file://'):
+                    result['mesh_path'] = filename.replace('file://', '')
                 else:
                     result['mesh_path'] = str(self.urdf_dir / filename)
 
@@ -563,6 +629,7 @@ def visualize_reachability_with_robot(
     output_html: str = "reachability_with_robot.html",
     title: str = "Arm Reachability with Robot Model",
     robot_opacity: float = 0.7,
+    package_paths: Dict[str, str] = None,
 ):
     """
     可视化可达空间和真实机械臂模型
@@ -575,6 +642,7 @@ def visualize_reachability_with_robot(
         output_html: 输出 HTML 文件路径
         title: 图表标题
         robot_opacity: 机器人模型透明度
+        package_paths: ROS 包名到路径的映射，如 {"robot_model": "/path/to/robot_model"}
     """
     # 加载可达点
     points = np.load(reachable_points_path)
@@ -632,7 +700,7 @@ def visualize_reachability_with_robot(
     if urdf_path and Path(urdf_path).exists():
         print(f"[INFO] 加载 URDF 模型: {urdf_path}")
         try:
-            loader = URDFMeshLoader(urdf_path)
+            loader = URDFMeshLoader(urdf_path, package_paths=package_paths)
             meshes = loader.get_all_meshes(joint_positions)
 
             if meshes:
@@ -695,7 +763,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="可达性可视化 + 真实机械臂模型")
     parser.add_argument("data_path", type=str, nargs='?',
-                        default="./reachability_output/franka_arm_reachable.npy",
+                        default="./reachability_output/robot_arm_reachable.npy",
                         help="可达点云文件")
     parser.add_argument("-u", "--urdf", type=str, default=None,
                         help="URDF 文件路径（显示真实机器人模型）")
@@ -707,8 +775,28 @@ def main():
                         help="图表标题")
     parser.add_argument("--robot-opacity", type=float, default=0.7,
                         help="机器人模型透明度 (0-1)")
+    parser.add_argument("--mesh-dir", "-m", type=str, default=None,
+                        help="网格文件目录路径 (用于解析 package:// 路径)")
+    parser.add_argument("--package", "-p", type=str, action='append', default=[],
+                        help="ROS 包映射，格式: package_name=/path/to/package (可多次使用)")
 
     args = parser.parse_args()
+
+    # 解析包路径映射
+    package_paths = {}
+    for pkg_mapping in args.package:
+        if '=' in pkg_mapping:
+            name, path = pkg_mapping.split('=', 1)
+            package_paths[name] = path
+            print(f"[INFO] 包路径映射: {name} -> {path}")
+
+    # 如果指定了 mesh-dir，将其作为默认包路径
+    if args.mesh_dir:
+        mesh_dir = Path(args.mesh_dir)
+        if mesh_dir.exists():
+            # 使用目录名作为默认包名
+            package_paths[mesh_dir.name] = str(mesh_dir)
+            print(f"[INFO] 使用网格目录: {mesh_dir}")
 
     visualize_reachability_with_robot(
         args.data_path,
@@ -717,6 +805,7 @@ def main():
         output_html=args.output,
         title=args.title,
         robot_opacity=args.robot_opacity,
+        package_paths=package_paths if package_paths else None,
     )
 
 
