@@ -50,6 +50,9 @@ def _build_generator(module):
         "generate_xrdf_from_urdf",
         "urdf_to_xrdf",
         "create_xrdf",
+        "generate_xrdf",
+        "create_xrdf_from_urdf",
+        "write_xrdf_from_urdf",
     ]
     for func_name in candidate_funcs:
         if hasattr(module, func_name):
@@ -59,12 +62,57 @@ def _build_generator(module):
         "XRDFGenerator",
         "XrdfGenerator",
         "UrdfToXrdf",
+        "UrdfToXRDF",
     ]
     for cls_name in candidate_classes:
         if hasattr(module, cls_name):
             cls = getattr(module, cls_name)
             return cls
 
+    def score_signature(sig: inspect.Signature) -> int:
+        score = 0
+        for name in sig.parameters:
+            lowered = name.lower()
+            if "urdf" in lowered:
+                score += 2
+            if "xrdf" in lowered or "output" in lowered or "path" in lowered:
+                score += 1
+        return score
+
+    best_candidate = None
+    best_score = 0
+    for name in dir(module):
+        if name.startswith("_"):
+            continue
+        attr = getattr(module, name)
+        if not callable(attr):
+            continue
+        try:
+            if inspect.isclass(attr):
+                sig = inspect.signature(attr.__init__)
+            else:
+                sig = inspect.signature(attr)
+        except (TypeError, ValueError):
+            continue
+        score = score_signature(sig)
+        if score > best_score:
+            best_candidate = attr
+            best_score = score
+
+    return best_candidate
+
+
+def _load_xrdf_module():
+    """加载 cuRobo XRDF 模块（兼容不同版本）。"""
+    module_candidates = [
+        "curobo.util.xrdf_generator",
+        "curobo.util.xrdf_utils",
+        "curobo.xrdf_utils",
+        "curobo.xrdf_generator",
+    ]
+    for module_name in module_candidates:
+        if importlib.util.find_spec(module_name) is not None:
+            return importlib.import_module(module_name)
     return None
 
 
@@ -78,10 +126,9 @@ def convert_urdf_to_xrdf(
     urdf_path = str(Path(urdf_path).expanduser().resolve())
     xrdf_path = str(Path(xrdf_path).expanduser().resolve())
 
-    if importlib.util.find_spec("curobo.util.xrdf_generator") is None:
-        raise XRDFConversionError("未找到 cuRobo，请先安装 curobo")
-
-    module = importlib.import_module("curobo.util.xrdf_generator")
+    module = _load_xrdf_module()
+    if module is None:
+        raise XRDFConversionError("未找到 cuRobo XRDF 模块，请先安装 curobo")
 
     generator = _build_generator(module)
     if generator is None:
