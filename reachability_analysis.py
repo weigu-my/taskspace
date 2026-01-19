@@ -26,6 +26,7 @@ import importlib.util
 import inspect
 import numpy as np
 import torch
+from typing import Any, Callable
 
 if importlib.util.find_spec("curobo") is None:
     CUROBO_AVAILABLE = False
@@ -36,6 +37,58 @@ else:
     from curobo.wrap.reacher.ik_solver import IKSolver, IKSolverConfig
 
     CUROBO_AVAILABLE = True
+
+
+def _call_with_supported_args(callable_obj: Callable, **kwargs):
+    signature = inspect.signature(callable_obj)
+    supported = {
+        name: value
+        for name, value in kwargs.items()
+        if name in signature.parameters and value is not None
+    }
+    return callable_obj(**supported)
+
+
+def _load_xrdf_module():
+    module_candidates = [
+        "curobo.util.xrdf_utils",
+        "curobo.xrdf_utils",
+        "curobo.util.xrdf_generator",
+        "curobo.xrdf_generator",
+    ]
+    for module_name in module_candidates:
+        if importlib.util.find_spec(module_name) is not None:
+            return __import__(module_name, fromlist=["*"])
+    return None
+
+
+def _load_xrdf_dict(xrdf_path: Path) -> dict[str, Any]:
+    module = _load_xrdf_module()
+    if module is not None:
+        for func_name in ("load_xrdf", "load_xrdf_file", "read_xrdf"):
+            if hasattr(module, func_name):
+                return _call_with_supported_args(
+                    getattr(module, func_name),
+                    xrdf_path=str(xrdf_path),
+                    path=str(xrdf_path),
+                    filename=str(xrdf_path),
+                    file_path=str(xrdf_path),
+                )
+
+    if xrdf_path.suffix.lower() in {".json"}:
+        with xrdf_path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError(
+            "当前 cuRobo 版本缺少 XRDF 加载接口，且未检测到 PyYAML。"
+            "请安装 PyYAML 或升级 cuRobo。"
+        ) from exc
+
+    with xrdf_path.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 
 @dataclass
@@ -134,12 +187,50 @@ class CuroboMultiSeedIK:
         self._warmup()
 
     def _load_robot_config(self, arm: ArmConfig):
-        if arm.xrdf_path:
-            if hasattr(RobotConfig, "from_xrdf"):
-                return RobotConfig.from_xrdf(arm.xrdf_path, self.tensor_args)
-            raise RuntimeError("当前 cuRobo 版本不支持 XRDF 加载")
+        if not arm.xrdf_path:
+            raise RuntimeError("未提供 XRDF")
 
-        raise RuntimeError("未提供 XRDF")
+        xrdf_path = Path(arm.xrdf_path).expanduser().resolve()
+
+        if hasattr(RobotConfig, "from_xrdf"):
+            return RobotConfig.from_xrdf(str(xrdf_path), self.tensor_args)
+
+        for method_name in (
+            "from_xrdf_file",
+            "load_from_xrdf",
+            "from_file",
+            "from_config",
+            "from_yaml",
+        ):
+            if hasattr(RobotConfig, method_name):
+                method = getattr(RobotConfig, method_name)
+                try:
+                    return _call_with_supported_args(
+                        method,
+                        xrdf_path=str(xrdf_path),
+                        path=str(xrdf_path),
+                        file_path=str(xrdf_path),
+                        config_path=str(xrdf_path),
+                        tensor_args=self.tensor_args,
+                    )
+                except TypeError:
+                    continue
+
+        xrdf_dict = _load_xrdf_dict(xrdf_path)
+
+        for method_name in ("from_dict", "from_config"):
+            if hasattr(RobotConfig, method_name):
+                method = getattr(RobotConfig, method_name)
+                return _call_with_supported_args(
+                    method,
+                    robot_cfg=xrdf_dict,
+                    config=xrdf_dict,
+                    tensor_args=self.tensor_args,
+                )
+
+        raise RuntimeError(
+            "当前 cuRobo 版本不支持 XRDF 加载，请升级 cuRobo 或使用兼容的 XRDF 解析器。"
+        )
 
     def _warmup(self):
         dummy_pos = torch.zeros((1, 3), device=self.device)
