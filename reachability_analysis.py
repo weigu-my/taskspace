@@ -942,12 +942,83 @@ def create_dual_arm_config() -> ReachabilityConfig:
 
 def main():
     """主函数"""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="通用机械臂可达性分析框架",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--urdf",
+        type=str,
+        default="",
+        help="URDF 文件路径（提供后将自动转换为 cuRobo 配置）",
+    )
+    parser.add_argument(
+        "--ee-link",
+        type=str,
+        default="",
+        help="末端执行器链接名（建议显式指定）",
+    )
+    parser.add_argument(
+        "--base-link",
+        type=str,
+        default="",
+        help="基座链接名（可选）",
+    )
+    parser.add_argument(
+        "--voxel-size",
+        type=float,
+        default=0.05,
+        help="体素大小 (m)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="./reachability_output",
+        help="结果输出目录",
+    )
+    parser.add_argument(
+        "--num-orientations",
+        type=int,
+        default=12,
+        help="灵巧性测试姿态数",
+    )
+    parser.add_argument(
+        "--bbox",
+        type=float,
+        nargs=6,
+        metavar=("X_MIN", "X_MAX", "Y_MIN", "Y_MAX", "Z_MIN", "Z_MAX"),
+        help="工作空间范围（6 个浮点数）",
+    )
+
+    args = parser.parse_args()
+
     print("="*60)
     print("通用机械臂可达性分析框架")
     print("="*60)
 
-    # 创建配置
-    config = create_example_config()
+    if args.urdf:
+        bbox = None
+        if args.bbox:
+            bbox = {
+                "x": (args.bbox[0], args.bbox[1]),
+                "y": (args.bbox[2], args.bbox[3]),
+                "z": (args.bbox[4], args.bbox[5]),
+            }
+        config = create_config_from_urdf(
+            urdf_path=args.urdf,
+            ee_link=args.ee_link,
+            base_link=args.base_link,
+            bbox=bbox,
+            voxel_size=args.voxel_size,
+            num_dexterity_orientations=args.num_orientations,
+        )
+        config.output_dir = args.output_dir
+    else:
+        print("[WARN] 未提供 --urdf，将使用内置示例配置 (franka.yml)。")
+        config = create_example_config()
+        config.output_dir = args.output_dir
 
     # 创建分析器
     analyzer = ReachabilityAnalyzer(config)
