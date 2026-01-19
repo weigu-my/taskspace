@@ -930,12 +930,148 @@ def create_dual_arm_config() -> ReachabilityConfig:
 
 def main():
     """主函数"""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="通用机械臂可达性分析框架",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例用法:
+  # 使用默认 URDF 文件
+  python reachability_analysis.py
+
+  # 指定 URDF 文件路径
+  python reachability_analysis.py --urdf /path/to/robot.urdf
+
+  # 指定末端执行器和基座链接
+  python reachability_analysis.py --urdf robot.urdf --ee-link tool0 --base-link base_link
+
+  # 自定义工作空间范围和体素大小
+  python reachability_analysis.py --urdf robot.urdf --voxel-size 0.03 --bbox -1,1,-1,1,0,1.5
+
+  # 设置灵巧性测试姿态数量
+  python reachability_analysis.py --urdf robot.urdf --num-orientations 24
+        """
+    )
+
+    parser.add_argument(
+        "--urdf", "-u",
+        type=str,
+        default="./wheel_robot.urdf",
+        help="URDF 文件路径 (默认: ./wheel_robot.urdf)"
+    )
+    parser.add_argument(
+        "--ee-link", "-e",
+        type=str,
+        default="",
+        help="末端执行器链接名 (默认: 自动检测)"
+    )
+    parser.add_argument(
+        "--base-link", "-b",
+        type=str,
+        default="",
+        help="基座链接名 (默认: 自动检测)"
+    )
+    parser.add_argument(
+        "--voxel-size", "-v",
+        type=float,
+        default=0.05,
+        help="体素大小 (米) (默认: 0.05)"
+    )
+    parser.add_argument(
+        "--bbox",
+        type=str,
+        default=None,
+        help="工作空间边界: xmin,xmax,ymin,ymax,zmin,zmax (默认: 自动估计)"
+    )
+    parser.add_argument(
+        "--num-orientations", "-n",
+        type=int,
+        default=12,
+        help="灵巧性测试姿态数量 (默认: 12)"
+    )
+    parser.add_argument(
+        "--output-dir", "-o",
+        type=str,
+        default="./reachability_output",
+        help="输出目录 (默认: ./reachability_output)"
+    )
+    parser.add_argument(
+        "--name",
+        type=str,
+        default="robot_arm",
+        help="机械臂名称 (默认: robot_arm)"
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1024,
+        help="GPU batch 大小 (默认: 1024)"
+    )
+    parser.add_argument(
+        "--no-self-collision",
+        action="store_true",
+        help="禁用自碰撞检测"
+    )
+
+    args = parser.parse_args()
+
     print("="*60)
     print("通用机械臂可达性分析框架")
     print("="*60)
 
+    # 解析工作空间边界
+    bbox = None
+    if args.bbox:
+        try:
+            values = [float(x) for x in args.bbox.split(",")]
+            if len(values) == 6:
+                bbox = {
+                    "x": (values[0], values[1]),
+                    "y": (values[2], values[3]),
+                    "z": (values[4], values[5])
+                }
+            else:
+                print("[WARN] bbox 格式错误，应为 xmin,xmax,ymin,ymax,zmin,zmax，将自动估计")
+        except ValueError:
+            print("[WARN] bbox 解析失败，将自动估计")
+
+    # 检查 URDF 文件是否存在
+    from pathlib import Path
+    urdf_path = Path(args.urdf)
+    if not urdf_path.exists():
+        print(f"[ERROR] URDF 文件不存在: {args.urdf}")
+        print("[INFO] 请指定正确的 URDF 文件路径，例如:")
+        print("       python reachability_analysis.py --urdf /path/to/your/robot.urdf")
+        return
+
+    print(f"[INFO] URDF 文件: {urdf_path.absolute()}")
+    print(f"[INFO] 末端链接: {args.ee_link or '自动检测'}")
+    print(f"[INFO] 基座链接: {args.base_link or '自动检测'}")
+    print(f"[INFO] 体素大小: {args.voxel_size}m")
+    print(f"[INFO] 灵巧性测试姿态数: {args.num_orientations}")
+    print(f"[INFO] 输出目录: {args.output_dir}")
+
     # 创建配置
-    config = create_example_config()
+    config = create_config_from_urdf(
+        urdf_path=str(urdf_path.absolute()),
+        arm_name=args.name,
+        ee_link=args.ee_link,
+        base_link=args.base_link,
+        bbox=bbox,
+        voxel_size=args.voxel_size,
+        num_dexterity_orientations=args.num_orientations,
+    )
+
+    # 更新配置
+    config.output_dir = args.output_dir
+    config.batch_size = args.batch_size
+
+    # 更新自碰撞设置
+    if args.no_self_collision:
+        for arm in config.arms:
+            arm.self_collision_check = False
+            arm.self_collision_opt = False
 
     # 创建分析器
     analyzer = ReachabilityAnalyzer(config)
