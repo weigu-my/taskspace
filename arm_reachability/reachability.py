@@ -326,7 +326,9 @@ class ReachabilityAnalyzer:
             最优关节配置 [n_positions, n_joints]
         """
         n_positions = len(positions)
-        n_joints = self.robot_config.num_dof
+        # 使用IK求解器的关节数，而不是URDF中的总关节数
+        # cuRobo只使用从基座到末端的运动链中的关节
+        n_joints = self.ik_solver.n_joints
         best_solutions = np.zeros((n_positions, n_joints), dtype=np.float32)
 
         # 获取可达位置的索引
