@@ -1,11 +1,11 @@
 """
-Visualization Module for Reachability Analysis.
+可达性分析可视化模块
 
-This module provides visualization of:
-- Robot mesh model from URDF
-- Reachability point cloud with:
-  - Point SIZE representing manipulability
-  - Point COLOR representing dexterity
+本模块提供以下可视化功能：
+- 从 URDF 渲染机器人网格模型
+- 可达性点云可视化：
+  - 点的 大小 表示可操作度
+  - 点的 颜色 表示灵活度
 """
 
 import os
@@ -21,34 +21,34 @@ from .utils import colormap_dexterity, size_from_manipulability
 
 @dataclass
 class MeshData:
-    """Container for mesh data."""
-    vertices: np.ndarray
-    faces: np.ndarray
-    link_name: str
-    transform: np.ndarray  # 4x4 transformation matrix
-    scale: Optional[np.ndarray] = None  # (3,) mesh scale
+    """网格数据容器"""
+    vertices: np.ndarray       # 顶点
+    faces: np.ndarray          # 面
+    link_name: str             # 链接名称
+    transform: np.ndarray      # 4x4 变换矩阵
+    scale: Optional[np.ndarray] = None  # (3,) 网格缩放
 
 
 class URDFMeshLoader:
-    """Load and transform meshes from URDF."""
+    """从 URDF 加载和变换网格"""
 
     def __init__(self, urdf_path: str):
         """
-        Initialize mesh loader.
+        初始化网格加载器
 
-        Args:
-            urdf_path: Path to URDF file
+        参数:
+            urdf_path: URDF 文件路径
         """
         self.urdf_path = os.path.abspath(urdf_path)
         self.urdf_dir = os.path.dirname(self.urdf_path)
         self.package_paths: Dict[str, str] = {}
 
-        # Try to auto-detect package paths
+        # 尝试自动检测包路径
         self._detect_package_paths()
 
     def _detect_package_paths(self):
-        """Auto-detect ROS package paths."""
-        # Look for common package locations
+        """自动检测 ROS 包路径"""
+        # 查找常见的包位置
         search_dirs = [
             self.urdf_dir,
             os.path.dirname(self.urdf_dir),
@@ -57,7 +57,7 @@ class URDFMeshLoader:
 
         for search_dir in search_dirs:
             if os.path.exists(search_dir):
-                # Try to find package.xml
+                # 尝试查找 package.xml
                 package_xml = os.path.join(search_dir, 'package.xml')
                 if os.path.exists(package_xml):
                     try:
@@ -71,40 +71,40 @@ class URDFMeshLoader:
 
     def resolve_mesh_path(self, mesh_filename: str) -> Optional[str]:
         """
-        Resolve mesh filename to actual file path.
+        将网格文件名解析为实际文件路径
 
-        Args:
-            mesh_filename: Mesh filename from URDF (may use package://)
+        参数:
+            mesh_filename: URDF 中的网格文件名（可能使用 package://）
 
-        Returns:
-            Resolved file path or None if not found
+        返回:
+            解析后的文件路径，未找到则返回 None
         """
         if not mesh_filename:
             return None
 
-        # Handle package:// URLs
+        # 处理 package:// URL
         if mesh_filename.startswith('package://'):
-            # Extract package name and relative path
+            # 提取包名和相对路径
             remainder = mesh_filename[len('package://'):]
             parts = remainder.split('/', 1)
 
             if len(parts) == 2:
                 package_name, relative_path = parts
 
-                # Check registered package paths
+                # 检查已注册的包路径
                 if package_name in self.package_paths:
                     resolved = os.path.join(self.package_paths[package_name], relative_path)
                     if os.path.exists(resolved):
                         return resolved
 
-                # Try common relative paths
+                # 尝试常见的相对路径
                 search_paths = [
                     os.path.join(self.urdf_dir, '..', relative_path),
                     os.path.join(self.urdf_dir, '..', '..', package_name, relative_path),
                     os.path.join(self.urdf_dir, relative_path),
                     os.path.join(self.urdf_dir, package_name, relative_path),
                     os.path.join(self.urdf_dir, '..', package_name, relative_path),
-                    # Try searching in current directory and subdirectories
+                    # 尝试在当前目录及子目录中搜索
                     os.path.join(os.path.dirname(self.urdf_dir), package_name, relative_path),
                     os.path.join(os.path.dirname(os.path.dirname(self.urdf_dir)), package_name, relative_path),
                 ]
@@ -113,14 +113,14 @@ class URDFMeshLoader:
                     resolved = os.path.abspath(path)
                     if os.path.exists(resolved):
                         return resolved
-                
-                # Last resort: try to find meshes directory near URDF
-                # Look for meshes directory in parent directories
+
+                # 最后尝试：在 URDF 附近查找 meshes 目录
+                # 向上搜索最多 3 级目录
                 current_dir = self.urdf_dir
-                for _ in range(3):  # Search up to 3 levels up
+                for _ in range(3):
                     meshes_dir = os.path.join(current_dir, 'meshes')
                     if os.path.exists(meshes_dir):
-                        # Extract just the filename from relative_path
+                        # 从 relative_path 提取文件名
                         mesh_basename = os.path.basename(relative_path)
                         potential_path = os.path.join(meshes_dir, mesh_basename)
                         if os.path.exists(potential_path):
@@ -129,17 +129,17 @@ class URDFMeshLoader:
 
             return None
 
-        # Handle file:// URLs
+        # 处理 file:// URL
         if mesh_filename.startswith('file://'):
             return mesh_filename[len('file://'):]
 
-        # Handle relative paths
+        # 处理相对路径
         if not os.path.isabs(mesh_filename):
             resolved = os.path.join(self.urdf_dir, mesh_filename)
             if os.path.exists(resolved):
                 return resolved
 
-            # Try parent directories
+            # 尝试父目录
             for parent in ['..', '../..', '../../..']:
                 resolved = os.path.join(self.urdf_dir, parent, mesh_filename)
                 resolved = os.path.abspath(resolved)
@@ -150,13 +150,13 @@ class URDFMeshLoader:
 
     def load_mesh(self, mesh_path: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         """
-        Load mesh from file.
+        从文件加载网格
 
-        Args:
-            mesh_path: Path to mesh file
+        参数:
+            mesh_path: 网格文件路径
 
-        Returns:
-            Tuple of (vertices, faces) or None if failed
+        返回:
+            (顶点, 面) 元组，失败则返回 None
         """
         try:
             import trimesh
@@ -164,7 +164,7 @@ class URDFMeshLoader:
             mesh = trimesh.load(mesh_path, force='mesh')
 
             if isinstance(mesh, trimesh.Scene):
-                # Combine all meshes in scene
+                # 合并场景中的所有网格
                 meshes = [g for g in mesh.geometry.values() if isinstance(g, trimesh.Trimesh)]
                 if meshes:
                     mesh = trimesh.util.concatenate(meshes)
@@ -174,7 +174,7 @@ class URDFMeshLoader:
             return mesh.vertices.astype(np.float32), mesh.faces.astype(np.int32)
 
         except Exception as e:
-            print(f"[Warning] Failed to load mesh {mesh_path}: {e}")
+            print(f"[警告] 加载网格失败 {mesh_path}: {e}")
             return None
 
     def load_robot_meshes(
@@ -183,24 +183,24 @@ class URDFMeshLoader:
         joint_positions: Optional[np.ndarray] = None
     ) -> List[MeshData]:
         """
-        Load all robot meshes with transforms.
+        加载所有机器人网格及其变换
 
-        Args:
-            robot_config: Robot configuration
-            joint_positions: Joint positions for FK (default: zero config)
+        参数:
+            robot_config: 机器人配置
+            joint_positions: FK 的关节位置（默认：零配置）
 
-        Returns:
-            List of MeshData objects
+        返回:
+            MeshData 对象列表
         """
         meshes = []
         loaded_count = 0
         failed_count = 0
 
-        # Get transforms for each link using FK
+        # 使用 FK 获取每个链接的变换
         link_transforms = self._compute_link_transforms(robot_config, joint_positions)
 
         for link in robot_config.links:
-            # Try visual mesh first, then collision mesh
+            # 优先使用可视化网格，其次是碰撞网格
             mesh_filename = link.visual_mesh or link.collision_mesh
             mesh_scale = link.visual_scale if link.visual_mesh else link.collision_scale
 
@@ -210,24 +210,24 @@ class URDFMeshLoader:
             mesh_path = self.resolve_mesh_path(mesh_filename)
             if not mesh_path:
                 failed_count += 1
-                if failed_count <= 5:  # Only print first 5 warnings to avoid spam
-                    print(f"[Warning] Could not resolve mesh: {mesh_filename}")
+                if failed_count <= 5:  # 只打印前 5 个警告以避免刷屏
+                    print(f"[警告] 无法解析网格: {mesh_filename}")
                 continue
 
             result = self.load_mesh(mesh_path)
             if result is None:
                 failed_count += 1
                 if failed_count <= 5:
-                    print(f"[Warning] Failed to load mesh: {mesh_path}")
+                    print(f"[警告] 加载网格失败: {mesh_path}")
                 continue
 
             vertices, faces = result
             loaded_count += 1
 
-            # Get transform for this link
+            # 获取该链接的变换
             transform = link_transforms.get(link.name, np.eye(4))
 
-            # Apply visual origin if present
+            # 如果存在可视化原点，应用它
             if link.visual_origin is not None:
                 visual_transform = self._origin_to_transform(link.visual_origin)
                 transform = transform @ visual_transform
@@ -240,7 +240,7 @@ class URDFMeshLoader:
                 scale=np.array(mesh_scale, dtype=np.float32) if mesh_scale else None
             ))
 
-        print(f"[MeshLoader] Loaded {loaded_count} meshes, {failed_count} failed")
+        print(f"[网格加载器] 已加载 {loaded_count} 个网格，{failed_count} 个失败")
         return meshes
 
     def _compute_link_transforms(
@@ -248,20 +248,20 @@ class URDFMeshLoader:
         robot_config: RobotConfig,
         joint_positions: Optional[np.ndarray] = None
     ) -> Dict[str, np.ndarray]:
-        """Compute FK transforms for all links."""
+        """计算所有链接的 FK 变换"""
         if joint_positions is None:
             joint_positions = np.zeros(robot_config.num_dof)
 
         transforms = {}
 
-        # Try using pinocchio for accurate FK
+        # 尝试使用 pinocchio 进行精确的 FK
         try:
             import pinocchio as pin
 
             model = pin.buildModelFromUrdf(robot_config.urdf_path)
             data = model.createData()
 
-            # Build full configuration
+            # 构建完整配置
             q = np.zeros(model.nq)
             joint_idx = 0
             for i, name in enumerate(model.names[1:]):
@@ -271,27 +271,27 @@ class URDFMeshLoader:
                         joint_idx += 1
                         break
 
-            # Compute FK
+            # 计算 FK
             pin.framesForwardKinematics(model, data, q)
 
-            # Get transforms for each frame
+            # 获取每个帧的变换
             for i, frame in enumerate(model.frames):
                 transforms[frame.name] = data.oMf[i].homogeneous.copy()
 
             return transforms
 
         except Exception as e:
-            print(f"[Warning] Pinocchio FK failed: {e}")
+            print(f"[警告] Pinocchio FK 失败: {e}")
 
-        # Fallback: compute transforms from joint chain
+        # 回退：从关节链计算变换
         transforms[robot_config.base_link] = np.eye(4)
 
-        # Build parent-child relationships
+        # 构建父子关系
         parent_to_joint = {}
         for joint in robot_config.joints:
             parent_to_joint[joint.child_link] = joint
 
-        # BFS to compute all transforms
+        # BFS 计算所有变换
         visited = {robot_config.base_link}
         queue = [robot_config.base_link]
         joint_idx = 0
@@ -301,7 +301,7 @@ class URDFMeshLoader:
 
             for joint in robot_config.joints:
                 if joint.parent_link == current and joint.child_link not in visited:
-                    # Compute joint transform
+                    # 计算关节变换
                     joint_transform = self._joint_to_transform(
                         joint,
                         joint_positions[joint_idx] if joint.type in ['revolute', 'continuous', 'prismatic'] and joint_idx < len(joint_positions) else 0
@@ -310,7 +310,7 @@ class URDFMeshLoader:
                     if joint.type in ['revolute', 'continuous', 'prismatic']:
                         joint_idx += 1
 
-                    # Chain transforms
+                    # 链接变换
                     transforms[joint.child_link] = transforms[current] @ joint_transform
 
                     visited.add(joint.child_link)
@@ -319,11 +319,11 @@ class URDFMeshLoader:
         return transforms
 
     def _joint_to_transform(self, joint, q: float) -> np.ndarray:
-        """Convert joint info and position to 4x4 transform."""
-        # Origin transform
+        """将关节信息和位置转换为 4x4 变换"""
+        # 原点变换
         T = self._origin_to_transform(joint.origin_xyz + joint.origin_rpy)
 
-        # Joint motion
+        # 关节运动
         if joint.type == 'revolute' or joint.type == 'continuous':
             axis = np.array(joint.axis)
             axis = axis / (np.linalg.norm(axis) + 1e-10)
@@ -342,7 +342,7 @@ class URDFMeshLoader:
         return T
 
     def _origin_to_transform(self, origin: List[float]) -> np.ndarray:
-        """Convert origin (xyz + rpy) to 4x4 transform."""
+        """将原点 (xyz + rpy) 转换为 4x4 变换"""
         T = np.eye(4)
 
         if len(origin) >= 3:
@@ -355,7 +355,7 @@ class URDFMeshLoader:
         return T
 
     def _rpy_to_matrix(self, roll: float, pitch: float, yaw: float) -> np.ndarray:
-        """Convert roll-pitch-yaw to rotation matrix."""
+        """将 roll-pitch-yaw 转换为旋转矩阵"""
         cr, sr = np.cos(roll), np.sin(roll)
         cp, sp = np.cos(pitch), np.sin(pitch)
         cy, sy = np.cos(yaw), np.sin(yaw)
@@ -369,7 +369,7 @@ class URDFMeshLoader:
         return R
 
     def _axis_angle_to_matrix(self, axis: np.ndarray, angle: float) -> np.ndarray:
-        """Convert axis-angle to rotation matrix (Rodrigues formula)."""
+        """使用罗德里格斯公式将轴角转换为旋转矩阵"""
         K = np.array([
             [0, -axis[2], axis[1]],
             [axis[2], 0, -axis[0]],
@@ -382,13 +382,13 @@ class URDFMeshLoader:
 
 class ReachabilityVisualizer:
     """
-    Visualize reachability analysis results.
+    可达性分析结果可视化器
 
-    Features:
-    - Robot mesh model rendering
-    - Reachability point cloud visualization
-    - Point SIZE = manipulability
-    - Point COLOR = dexterity
+    功能：
+    - 机器人网格模型渲染
+    - 可达性点云可视化
+    - 点的 大小 = 可操作度
+    - 点的 颜色 = 灵活度
     """
 
     def __init__(
@@ -397,11 +397,11 @@ class ReachabilityVisualizer:
         result: ReachabilityResult
     ):
         """
-        Initialize visualizer.
+        初始化可视化器
 
-        Args:
-            robot_config: Robot configuration
-            result: Reachability analysis result
+        参数:
+            robot_config: 机器人配置
+            result: 可达性分析结果
         """
         self.robot_config = robot_config
         self.result = result
@@ -417,33 +417,33 @@ class ReachabilityVisualizer:
         save_html: Optional[str] = None
     ):
         """
-        Create interactive 3D visualization using Plotly.
+        使用 Plotly 创建交互式 3D 可视化
 
-        Args:
-            show_robot: Whether to show robot mesh
-            show_points: Whether to show reachability points
-            point_size_range: (min_size, max_size) for point scaling
-            robot_opacity: Opacity of robot mesh
-            robot_color: Color of robot mesh
-            save_html: Path to save HTML file
+        参数:
+            show_robot: 是否显示机器人网格
+            show_points: 是否显示可达性点
+            point_size_range: (最小大小, 最大大小) 用于点缩放
+            robot_opacity: 机器人网格不透明度
+            robot_color: 机器人网格颜色
+            save_html: HTML 文件保存路径
         """
         import plotly.graph_objects as go
 
         fig = go.Figure()
 
-        # Add robot meshes
+        # 添加机器人网格
         if show_robot:
-            print(f"[Visualization] Loading robot meshes from {self.robot_config.urdf_path}...")
+            print(f"[可视化] 从 {self.robot_config.urdf_path} 加载机器人网格...")
             meshes = self.mesh_loader.load_robot_meshes(self.robot_config)
-            
+
             if len(meshes) == 0:
-                print(f"[Warning] No meshes loaded! Robot model will not be visible in visualization.")
-                print(f"[Warning] Check that mesh files exist and paths are correct in URDF.")
+                print(f"[警告] 未加载任何网格！机器人模型将在可视化中不可见。")
+                print(f"[警告] 请检查 URDF 中的网格文件是否存在且路径正确。")
             else:
-                print(f"[Visualization] Adding {len(meshes)} mesh(es) to visualization...")
+                print(f"[可视化] 向可视化添加 {len(meshes)} 个网格...")
 
             for mesh_data in meshes:
-                # Transform vertices
+                # 变换顶点
                 vertices = mesh_data.vertices
                 if mesh_data.scale is not None:
                     vertices = vertices * mesh_data.scale.reshape(1, 3)
@@ -451,7 +451,7 @@ class ReachabilityVisualizer:
                 vertices_h = np.hstack([vertices, ones])
                 transformed = (mesh_data.transform @ vertices_h.T).T[:, :3]
 
-                # Add mesh
+                # 添加网格
                 fig.add_trace(go.Mesh3d(
                     x=transformed[:, 0],
                     y=transformed[:, 1],
@@ -466,33 +466,33 @@ class ReachabilityVisualizer:
                     flatshading=True
                 ))
 
-        # Add reachability points
+        # 添加可达性点
         if show_points and self.result.reachable_count > 0:
-            # Get reachable points and their metrics
+            # 获取可达点及其指标
             reachable_mask = self.result.reachable_mask
             points = self.result.grid_points[reachable_mask]
             dexterity = self.result.dexterity[reachable_mask]
             manipulability = self.result.manipulability[reachable_mask]
 
-            # Compute colors (dexterity)
+            # 计算颜色（灵活度）
             colors = colormap_dexterity(dexterity)
 
-            # Compute sizes (manipulability)
+            # 计算大小（可操作度）
             sizes = size_from_manipulability(
                 manipulability,
                 min_size=point_size_range[0],
                 max_size=point_size_range[1]
             )
 
-            # Create hover text
+            # 创建悬停文本
             hover_text = [
-                f"Position: ({x:.3f}, {y:.3f}, {z:.3f})<br>"
-                f"Dexterity: {d}<br>"
-                f"Manipulability: {m:.4f}"
+                f"位置: ({x:.3f}, {y:.3f}, {z:.3f})<br>"
+                f"灵活度: {d}<br>"
+                f"可操作度: {m:.4f}"
                 for (x, y, z), d, m in zip(points, dexterity, manipulability)
             ]
 
-            # Convert colors to plotly format
+            # 转换颜色为 plotly 格式
             color_strings = [f'rgb({int(r*255)},{int(g*255)},{int(b*255)})' for r, g, b in colors]
 
             fig.add_trace(go.Scatter3d(
@@ -508,13 +508,13 @@ class ReachabilityVisualizer:
                 ),
                 text=hover_text,
                 hoverinfo='text',
-                name='Reachable Points'
+                name='可达点'
             ))
 
-        # Configure layout
+        # 配置布局
         fig.update_layout(
             title=dict(
-                text=f"Reachability Analysis: {self.robot_config.name}",
+                text=f"可达性分析: {self.robot_config.name}",
                 x=0.5
             ),
             scene=dict(
@@ -537,9 +537,9 @@ class ReachabilityVisualizer:
             margin=dict(l=0, r=0, b=0, t=40)
         )
 
-        # Add color bar for dexterity
+        # 为灵活度添加颜色条
         if show_points and self.result.reachable_count > 0:
-            # Create dummy trace for colorbar
+            # 创建用于颜色条的虚拟轨迹
             fig.add_trace(go.Scatter3d(
                 x=[None],
                 y=[None],
@@ -547,16 +547,16 @@ class ReachabilityVisualizer:
                 mode='markers',
                 marker=dict(
                     colorscale=[
-                        [0, 'rgb(0,0,255)'],      # Blue
-                        [0.25, 'rgb(0,255,255)'], # Cyan
-                        [0.5, 'rgb(0,255,0)'],    # Green
-                        [0.75, 'rgb(255,255,0)'], # Yellow
-                        [1, 'rgb(255,0,0)']       # Red
+                        [0, 'rgb(0,0,255)'],      # 蓝色
+                        [0.25, 'rgb(0,255,255)'], # 青色
+                        [0.5, 'rgb(0,255,0)'],    # 绿色
+                        [0.75, 'rgb(255,255,0)'], # 黄色
+                        [1, 'rgb(255,0,0)']       # 红色
                     ],
                     cmin=0,
                     cmax=int(np.max(self.result.dexterity)),
                     colorbar=dict(
-                        title="Dexterity",
+                        title="灵活度",
                         x=1.02,
                         thickness=20
                     ),
@@ -565,10 +565,10 @@ class ReachabilityVisualizer:
                 showlegend=False
             ))
 
-        # Show or save
+        # 显示或保存
         if save_html:
             fig.write_html(save_html)
-            print(f"Saved visualization to {save_html}")
+            print(f"已保存可视化到 {save_html}")
         else:
             fig.show()
 
@@ -576,21 +576,21 @@ class ReachabilityVisualizer:
 
     def visualize_matplotlib(
         self,
-        show_robot: bool = False,  # Matplotlib 3D doesn't handle meshes well
+        show_robot: bool = False,  # Matplotlib 3D 不能很好地处理网格
         point_size_range: Tuple[float, float] = (5.0, 100.0),
         elevation: float = 20,
         azimuth: float = 45,
         save_path: Optional[str] = None
     ):
         """
-        Create static 3D visualization using Matplotlib.
+        使用 Matplotlib 创建静态 3D 可视化
 
-        Args:
-            show_robot: Whether to show robot skeleton
-            point_size_range: (min_size, max_size) for point scaling
-            elevation: View elevation angle
-            azimuth: View azimuth angle
-            save_path: Path to save figure
+        参数:
+            show_robot: 是否显示机器人骨架
+            point_size_range: (最小大小, 最大大小) 用于点缩放
+            elevation: 视角仰角
+            azimuth: 视角方位角
+            save_path: 图像保存路径
         """
         import matplotlib.pyplot as plt
         from mpl_toolkits.mplot3d import Axes3D
@@ -598,14 +598,14 @@ class ReachabilityVisualizer:
         fig = plt.figure(figsize=(12, 10))
         ax = fig.add_subplot(111, projection='3d')
 
-        # Add reachability points
+        # 添加可达性点
         if self.result.reachable_count > 0:
             reachable_mask = self.result.reachable_mask
             points = self.result.grid_points[reachable_mask]
             dexterity = self.result.dexterity[reachable_mask]
             manipulability = self.result.manipulability[reachable_mask]
 
-            # Compute colors and sizes
+            # 计算颜色和大小
             colors = colormap_dexterity(dexterity)
             sizes = size_from_manipulability(
                 manipulability,
@@ -613,7 +613,7 @@ class ReachabilityVisualizer:
                 max_size=point_size_range[1]
             )
 
-            # Scatter plot
+            # 散点图
             scatter = ax.scatter(
                 points[:, 0],
                 points[:, 1],
@@ -624,20 +624,20 @@ class ReachabilityVisualizer:
                 depthshade=True
             )
 
-        # Add robot skeleton if requested
+        # 如果需要，添加机器人骨架
         if show_robot:
             self._draw_robot_skeleton(ax)
 
-        # Configure view
+        # 配置视图
         ax.view_init(elev=elevation, azim=azimuth)
         ax.set_xlabel('X (m)')
         ax.set_ylabel('Y (m)')
         ax.set_zlabel('Z (m)')
-        ax.set_title(f'Reachability: {self.robot_config.name}\n'
-                    f'Points: {self.result.reachable_count}/{self.result.total_points} '
+        ax.set_title(f'可达性: {self.robot_config.name}\n'
+                    f'点数: {self.result.reachable_count}/{self.result.total_points} '
                     f'({self.result.reachability_ratio*100:.1f}%)')
 
-        # Add colorbar
+        # 添加颜色条
         if self.result.reachable_count > 0:
             sm = plt.cm.ScalarMappable(
                 cmap=plt.cm.jet,
@@ -645,11 +645,11 @@ class ReachabilityVisualizer:
             )
             sm.set_array([])
             cbar = plt.colorbar(sm, ax=ax, shrink=0.6, pad=0.1)
-            cbar.set_label('Dexterity')
+            cbar.set_label('灵活度')
 
-        # Add legend for size
+        # 添加大小图例
         if self.result.reachable_count > 0:
-            ax.text2D(0.02, 0.98, "Size = Manipulability",
+            ax.text2D(0.02, 0.98, "大小 = 可操作度",
                      transform=ax.transAxes, fontsize=10,
                      verticalalignment='top')
 
@@ -657,14 +657,14 @@ class ReachabilityVisualizer:
 
         if save_path:
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            print(f"Saved visualization to {save_path}")
+            print(f"已保存可视化到 {save_path}")
         else:
             plt.show()
 
         return fig, ax
 
     def _draw_robot_skeleton(self, ax):
-        """Draw robot as skeleton (lines between joint origins)."""
+        """绘制机器人骨架（关节原点之间的连线）"""
         try:
             import pinocchio as pin
 
@@ -674,12 +674,12 @@ class ReachabilityVisualizer:
             q = np.zeros(model.nq)
             pin.framesForwardKinematics(model, data, q)
 
-            # Draw links as lines
+            # 将链接绘制为线段
             for i in range(1, len(model.frames)):
                 frame = model.frames[i]
                 pos = data.oMf[i].translation
 
-                # Find parent
+                # 查找父节点
                 parent_id = frame.parent
                 if parent_id > 0 and parent_id < len(data.oMf):
                     parent_pos = data.oMf[parent_id].translation
@@ -691,56 +691,56 @@ class ReachabilityVisualizer:
                         'k-', linewidth=2, alpha=0.7
                     )
 
-                # Draw joint position
+                # 绘制关节位置
                 ax.scatter(pos[0], pos[1], pos[2],
                           c='black', s=30, marker='o')
 
         except Exception as e:
-            print(f"[Warning] Could not draw robot skeleton: {e}")
+            print(f"[警告] 无法绘制机器人骨架: {e}")
 
     def create_summary_plot(self, save_path: Optional[str] = None):
         """
-        Create summary visualization with multiple views.
+        创建多视图汇总可视化
 
-        Args:
-            save_path: Path to save figure
+        参数:
+            save_path: 图像保存路径
         """
         import matplotlib.pyplot as plt
 
         fig = plt.figure(figsize=(16, 10))
 
-        # Main 3D view
+        # 主 3D 视图
         ax1 = fig.add_subplot(2, 2, 1, projection='3d')
         self._plot_points_3d(ax1, elev=30, azim=45)
-        ax1.set_title('3D View (Isometric)')
+        ax1.set_title('3D 视图（等轴测）')
 
-        # Top view (XY)
+        # 俯视图 (XY)
         ax2 = fig.add_subplot(2, 2, 2)
-        self._plot_points_2d(ax2, 'x', 'y', 'Top View (XY)')
+        self._plot_points_2d(ax2, 'x', 'y', '俯视图 (XY)')
 
-        # Front view (XZ)
+        # 正视图 (XZ)
         ax3 = fig.add_subplot(2, 2, 3)
-        self._plot_points_2d(ax3, 'x', 'z', 'Front View (XZ)')
+        self._plot_points_2d(ax3, 'x', 'z', '正视图 (XZ)')
 
-        # Side view (YZ)
+        # 侧视图 (YZ)
         ax4 = fig.add_subplot(2, 2, 4)
-        self._plot_points_2d(ax4, 'y', 'z', 'Side View (YZ)')
+        self._plot_points_2d(ax4, 'y', 'z', '侧视图 (YZ)')
 
-        plt.suptitle(f'Reachability Analysis: {self.robot_config.name}\n'
-                    f'Reachable: {self.result.reachable_count}/{self.result.total_points} '
+        plt.suptitle(f'可达性分析: {self.robot_config.name}\n'
+                    f'可达: {self.result.reachable_count}/{self.result.total_points} '
                     f'({self.result.reachability_ratio*100:.1f}%)')
         plt.tight_layout()
 
         if save_path:
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            print(f"Saved summary to {save_path}")
+            print(f"已保存汇总图到 {save_path}")
         else:
             plt.show()
 
         return fig
 
     def _plot_points_3d(self, ax, elev=30, azim=45):
-        """Helper to plot 3D points."""
+        """绘制 3D 点的辅助函数"""
         if self.result.reachable_count > 0:
             reachable_mask = self.result.reachable_mask
             points = self.result.grid_points[reachable_mask]
@@ -757,7 +757,7 @@ class ReachabilityVisualizer:
         ax.set_zlabel('Z')
 
     def _plot_points_2d(self, ax, x_axis: str, y_axis: str, title: str):
-        """Helper to plot 2D projection."""
+        """绘制 2D 投影的辅助函数"""
         axis_map = {'x': 0, 'y': 1, 'z': 2}
 
         if self.result.reachable_count > 0:
@@ -772,7 +772,8 @@ class ReachabilityVisualizer:
                 points[:, xi], points[:, yi],
                 c=dexterity, cmap='jet', s=3, alpha=0.5
             )
-            plt.colorbar(scatter, ax=ax, label='Dexterity')
+            import matplotlib.pyplot as plt
+            plt.colorbar(scatter, ax=ax, label='灵活度')
 
         ax.set_xlabel(f'{x_axis.upper()} (m)')
         ax.set_ylabel(f'{y_axis.upper()} (m)')
@@ -788,27 +789,27 @@ def visualize_results(
     show: bool = True
 ):
     """
-    Convenience function to visualize results.
+    可视化结果的便捷函数
 
-    Args:
-        urdf_path: Path to URDF file
+    参数:
+        urdf_path: URDF 文件路径
         result: ReachabilityResult
-        output_dir: Directory to save visualizations
-        show: Whether to display interactive visualization
+        output_dir: 保存可视化的目录
+        show: 是否显示交互式可视化
     """
     parser = URDFParser(urdf_path)
     robot_config = parser.parse()
 
     visualizer = ReachabilityVisualizer(robot_config, result)
 
-    # Save HTML visualization
+    # 保存 HTML 可视化
     html_path = os.path.join(output_dir, "reachability_visualization.html")
     visualizer.visualize_plotly(
         show_robot=True,
         save_html=html_path
     )
 
-    # Save summary plot
+    # 保存汇总图
     summary_path = os.path.join(output_dir, "reachability_summary.png")
     visualizer.create_summary_plot(save_path=summary_path)
 

@@ -1,8 +1,7 @@
 """
-URDF Parser and cuRobo Configuration Generator.
+URDF 解析器和 cuRobo 配置生成器
 
-This module handles parsing URDF files and generating cuRobo-compatible
-configuration for any robot arm.
+本模块负责解析 URDF 文件并为任意机械臂生成 cuRobo 兼容的配置。
 """
 
 import os
@@ -15,75 +14,75 @@ import numpy as np
 
 @dataclass
 class JointInfo:
-    """Information about a robot joint."""
-    name: str
-    type: str
-    parent_link: str
-    child_link: str
-    axis: List[float] = field(default_factory=lambda: [0, 0, 1])
-    lower_limit: float = -np.pi
-    upper_limit: float = np.pi
-    velocity_limit: float = 2.0
-    effort_limit: float = 100.0
-    origin_xyz: List[float] = field(default_factory=lambda: [0, 0, 0])
-    origin_rpy: List[float] = field(default_factory=lambda: [0, 0, 0])
+    """机器人关节信息"""
+    name: str                      # 关节名称
+    type: str                      # 关节类型
+    parent_link: str               # 父链接名称
+    child_link: str                # 子链接名称
+    axis: List[float] = field(default_factory=lambda: [0, 0, 1])  # 关节轴
+    lower_limit: float = -np.pi    # 下限位
+    upper_limit: float = np.pi     # 上限位
+    velocity_limit: float = 2.0    # 速度限制
+    effort_limit: float = 100.0    # 力矩限制
+    origin_xyz: List[float] = field(default_factory=lambda: [0, 0, 0])  # 原点位置
+    origin_rpy: List[float] = field(default_factory=lambda: [0, 0, 0])  # 原点姿态
 
 
 @dataclass
 class LinkInfo:
-    """Information about a robot link."""
-    name: str
-    visual_mesh: Optional[str] = None
-    collision_mesh: Optional[str] = None
-    visual_origin: Optional[List[float]] = None
-    collision_origin: Optional[List[float]] = None
-    visual_scale: Optional[List[float]] = None
-    collision_scale: Optional[List[float]] = None
+    """机器人链接信息"""
+    name: str                                      # 链接名称
+    visual_mesh: Optional[str] = None              # 可视化网格路径
+    collision_mesh: Optional[str] = None           # 碰撞网格路径
+    visual_origin: Optional[List[float]] = None    # 可视化原点
+    collision_origin: Optional[List[float]] = None # 碰撞原点
+    visual_scale: Optional[List[float]] = None     # 可视化缩放
+    collision_scale: Optional[List[float]] = None  # 碰撞缩放
 
 
 @dataclass
 class RobotConfig:
-    """Extracted robot configuration from URDF."""
-    name: str
-    joints: List[JointInfo]
-    links: List[LinkInfo]
-    base_link: str
-    ee_link: str
-    urdf_path: str
-    urdf_dir: str
+    """从 URDF 提取的机器人配置"""
+    name: str                      # 机器人名称
+    joints: List[JointInfo]        # 关节列表
+    links: List[LinkInfo]          # 链接列表
+    base_link: str                 # 基座链接名称
+    ee_link: str                   # 末端执行器链接名称
+    urdf_path: str                 # URDF 文件路径
+    urdf_dir: str                  # URDF 文件目录
 
     @property
     def active_joints(self) -> List[JointInfo]:
-        """Get list of active (non-fixed) joints."""
+        """获取活动（非固定）关节列表"""
         return [j for j in self.joints if j.type in ['revolute', 'prismatic', 'continuous']]
 
     @property
     def num_dof(self) -> int:
-        """Get number of degrees of freedom."""
+        """获取自由度数量"""
         return len(self.active_joints)
 
 
 class URDFParser:
-    """Parser for URDF files."""
+    """URDF 文件解析器"""
 
-    # Keywords to identify end-effector links
+    # 用于识别末端执行器链接的关键词
     EE_KEYWORDS = [
         'end_effector', 'ee', 'tool', 'gripper', 'hand',
         'tcp', 'flange', 'wrist', 'link_6', 'link_7', 'link6', 'link7'
     ]
 
-    # Keywords to identify base links (higher priority first)
+    # 用于识别基座链接的关键词（优先级从高到低）
     BASE_KEYWORDS = ['base_link', 'base', 'root', 'link_0', 'link0', 'world']
 
-    # Links that often serve as an external world frame
+    # 通常作为外部世界坐标系的链接
     WORLD_LIKE = {'world', 'map', 'odom'}
 
     def __init__(self, urdf_path: str):
         """
-        Initialize URDF parser.
+        初始化 URDF 解析器
 
-        Args:
-            urdf_path: Path to URDF file
+        参数:
+            urdf_path: URDF 文件路径
         """
         self.urdf_path = os.path.abspath(urdf_path)
         self.urdf_dir = os.path.dirname(self.urdf_path)
@@ -93,19 +92,19 @@ class URDFParser:
         self._parse_urdf()
 
     def _parse_urdf(self):
-        """Parse the URDF file."""
+        """解析 URDF 文件"""
         if not os.path.exists(self.urdf_path):
-            raise FileNotFoundError(f"URDF file not found: {self.urdf_path}")
+            raise FileNotFoundError(f"URDF 文件不存在: {self.urdf_path}")
 
         self.tree = ET.parse(self.urdf_path)
         self.root = self.tree.getroot()
 
     def get_robot_name(self) -> str:
-        """Get the robot name from URDF."""
+        """从 URDF 获取机器人名称"""
         return self.root.get('name', 'robot')
 
     def parse_joints(self) -> List[JointInfo]:
-        """Parse all joints from URDF."""
+        """从 URDF 解析所有关节"""
         joints = []
 
         for joint_elem in self.root.findall('joint'):
@@ -115,24 +114,24 @@ class URDFParser:
         return joints
 
     def _parse_joint_element(self, joint_elem: ET.Element) -> JointInfo:
-        """Parse a single joint element."""
+        """解析单个关节元素"""
         name = joint_elem.get('name', '')
         joint_type = joint_elem.get('type', 'fixed')
 
-        # Get parent and child links
+        # 获取父子链接
         parent_elem = joint_elem.find('parent')
         child_elem = joint_elem.find('child')
         parent_link = parent_elem.get('link', '') if parent_elem is not None else ''
         child_link = child_elem.get('link', '') if child_elem is not None else ''
 
-        # Get axis
+        # 获取关节轴
         axis = [0, 0, 1]
         axis_elem = joint_elem.find('axis')
         if axis_elem is not None:
             axis_str = axis_elem.get('xyz', '0 0 1')
             axis = [float(x) for x in axis_str.split()]
 
-        # Get limits
+        # 获取限位
         lower = -np.pi
         upper = np.pi
         velocity = 2.0
@@ -145,12 +144,12 @@ class URDFParser:
             velocity = float(limit_elem.get('velocity', str(velocity)))
             effort = float(limit_elem.get('effort', str(effort)))
 
-        # For continuous joints, set wide limits
+        # 对于连续关节，设置较大的限位
         if joint_type == 'continuous':
             lower = -2 * np.pi
             upper = 2 * np.pi
 
-        # Get origin
+        # 获取原点
         origin_xyz = [0, 0, 0]
         origin_rpy = [0, 0, 0]
         origin_elem = joint_elem.find('origin')
@@ -175,7 +174,7 @@ class URDFParser:
         )
 
     def parse_links(self) -> List[LinkInfo]:
-        """Parse all links from URDF."""
+        """从 URDF 解析所有链接"""
         links = []
 
         for link_elem in self.root.findall('link'):
@@ -185,7 +184,7 @@ class URDFParser:
         return links
 
     def _parse_link_element(self, link_elem: ET.Element) -> LinkInfo:
-        """Parse a single link element."""
+        """解析单个链接元素"""
         name = link_elem.get('name', '')
 
         visual_mesh = None
@@ -195,7 +194,7 @@ class URDFParser:
         visual_scale = None
         collision_scale = None
 
-        # Parse visual
+        # 解析可视化部分
         visual_elem = link_elem.find('visual')
         if visual_elem is not None:
             geometry = visual_elem.find('geometry')
@@ -216,7 +215,7 @@ class URDFParser:
                 rpy = origin.get('rpy', '0 0 0')
                 visual_origin = [float(x) for x in xyz.split()] + [float(x) for x in rpy.split()]
 
-        # Parse collision
+        # 解析碰撞部分
         collision_elem = link_elem.find('collision')
         if collision_elem is not None:
             geometry = collision_elem.find('geometry')
@@ -248,20 +247,20 @@ class URDFParser:
         )
 
     def detect_base_link(self, joints: List[JointInfo], links: List[LinkInfo]) -> str:
-        """Auto-detect the base link."""
+        """自动检测基座链接"""
         link_names = {link.name for link in links}
 
-        # Find links that are only parents (not children of any joint)
+        # 找出仅作为父链接的链接（不是任何关节的子链接）
         child_links = {j.child_link for j in joints}
         root_links = link_names - child_links
 
-        # Special-case: many URDFs have a dummy 'world' root and a fixed joint to the real base.
-        # Example (AR5): world --(fixed)--> <robot_base>
-        # In this case, we want <robot_base> as base_link so analysis is centered at the robot base.
+        # 特殊情况：许多 URDF 有一个虚拟的 'world' 根节点和一个固定关节连接到实际基座
+        # 例如 (AR5): world --(fixed)--> <robot_base>
+        # 此时我们希望 <robot_base> 作为 base_link，使分析以机器人基座为中心
         if root_links:
             world_roots = [l for l in root_links if l.lower() in self.WORLD_LIKE]
             if world_roots:
-                # Prefer children of fixed joints coming out of world-like roots
+                # 优先选择从 world 类型根节点通过固定关节连接的子链接
                 candidates = []
                 for j in joints:
                     if j.parent_link.lower() in self.WORLD_LIKE and j.type == 'fixed':
@@ -269,68 +268,68 @@ class URDFParser:
                             candidates.append(j.child_link)
 
                 if candidates:
-                    # Prefer names that look like base/base_link
+                    # 优先选择看起来像 base/base_link 的名称
                     for cand in candidates:
                         cand_lower = cand.lower()
                         if 'base_link' in cand_lower or cand_lower.endswith('base') or 'base' in cand_lower:
                             return cand
-                    # Otherwise pick the first candidate deterministically
+                    # 否则确定性地选择第一个候选
                     return sorted(candidates)[0]
 
-        # Check root links for base keywords
+        # 检查根链接是否包含基座关键词
         for link in root_links:
             link_lower = link.lower()
             for keyword in self.BASE_KEYWORDS:
                 if keyword in link_lower:
                     return link
 
-        # Return first root link if any
+        # 返回第一个根链接（如果有）
         if root_links:
             return list(root_links)[0]
 
-        # Fallback: first link
+        # 回退：第一个链接
         if links:
             return links[0].name
 
         return "base_link"
 
     def detect_ee_link(self, joints: List[JointInfo], links: List[LinkInfo]) -> str:
-        """Auto-detect the end-effector link."""
+        """自动检测末端执行器链接"""
         link_names = {link.name for link in links}
 
-        # Find links that are only children (not parents of any joint)
+        # 找出仅作为子链接的链接（不是任何关节的父链接）
         parent_links = {j.parent_link for j in joints}
         leaf_links = link_names - parent_links
 
-        # Check leaf links for EE keywords
+        # 检查叶子链接是否包含末端执行器关键词
         for link in leaf_links:
             link_lower = link.lower()
             for keyword in self.EE_KEYWORDS:
                 if keyword in link_lower:
                     return link
 
-        # Check all links for EE keywords
+        # 检查所有链接是否包含末端执行器关键词
         for link in links:
             link_lower = link.name.lower()
             for keyword in self.EE_KEYWORDS:
                 if keyword in link_lower:
                     return link.name
 
-        # Find the longest kinematic chain
+        # 查找最长运动链
         if joints:
             chain = self._find_longest_chain(joints, links)
             if chain:
                 return chain[-1]
 
-        # Fallback: last leaf link
+        # 回退：最后一个叶子链接
         if leaf_links:
             return list(leaf_links)[-1]
 
         return links[-1].name if links else "ee_link"
 
     def _find_longest_chain(self, joints: List[JointInfo], links: List[LinkInfo]) -> List[str]:
-        """Find the longest kinematic chain in the robot."""
-        # Build adjacency graph
+        """查找机器人中最长的运动链"""
+        # 构建邻接图
         link_names = {link.name for link in links}
         child_to_parent = {}
         parent_to_children = {}
@@ -342,10 +341,10 @@ class URDFParser:
                     parent_to_children[joint.parent_link] = []
                 parent_to_children[joint.parent_link].append(joint.child_link)
 
-        # Find leaf links
+        # 查找叶子链接
         leaf_links = link_names - set(parent_to_children.keys())
 
-        # Find longest chain from any leaf to root
+        # 从任意叶子到根查找最长链
         longest_chain = []
         for leaf in leaf_links:
             chain = [leaf]
@@ -361,8 +360,8 @@ class URDFParser:
 
     def get_kinematic_chain(self, base_link: str, ee_link: str,
                            joints: List[JointInfo]) -> List[JointInfo]:
-        """Get the kinematic chain from base to end-effector."""
-        # Build parent-child mapping
+        """获取从基座到末端执行器的运动链"""
+        # 构建父子映射
         link_to_joint = {j.child_link: j for j in joints}
 
         chain = []
@@ -380,14 +379,14 @@ class URDFParser:
 
     def parse(self, base_link: str = "", ee_link: str = "") -> RobotConfig:
         """
-        Parse URDF and return robot configuration.
+        解析 URDF 并返回机器人配置
 
-        Args:
-            base_link: Base link name (auto-detect if empty)
-            ee_link: End-effector link name (auto-detect if empty)
+        参数:
+            base_link: 基座链接名（为空则自动检测）
+            ee_link: 末端执行器链接名（为空则自动检测）
 
-        Returns:
-            RobotConfig with extracted information
+        返回:
+            包含提取信息的 RobotConfig
         """
         joints = self.parse_joints()
         links = self.parse_links()
@@ -410,43 +409,43 @@ class URDFParser:
 
 
 class CuroboConfigGenerator:
-    """Generate cuRobo configuration from robot config."""
+    """从机器人配置生成 cuRobo 配置"""
 
     def __init__(self, robot_config: RobotConfig):
         """
-        Initialize config generator.
+        初始化配置生成器
 
-        Args:
-            robot_config: Parsed robot configuration
+        参数:
+            robot_config: 解析后的机器人配置
         """
         self.robot = robot_config
 
     def generate(self, output_path: Optional[str] = None) -> Dict[str, Any]:
         """
-        Generate cuRobo configuration.
+        生成 cuRobo 配置
 
-        Args:
-            output_path: Optional path to save YAML config
+        参数:
+            output_path: 可选的 YAML 配置保存路径
 
-        Returns:
-            Configuration dictionary
+        返回:
+            配置字典
         """
-        # Get kinematic chain
+        # 获取运动链
         chain_joints = self.robot.active_joints
 
-        # Generate joint names
+        # 生成关节名称
         joint_names = [j.name for j in chain_joints]
 
-        # Generate default configuration (middle of joint limits)
+        # 生成默认配置（关节限位的中点）
         default_config = []
         for joint in chain_joints:
             mid = (joint.lower_limit + joint.upper_limit) / 2
             default_config.append(float(mid))
 
-        # Generate retract configuration (same as default for safety)
+        # 生成收回配置（为安全起见与默认配置相同）
         retract_config = default_config.copy()
 
-        # Generate CSPACE configuration
+        # 生成构型空间配置
         cspace_config = {
             'joint_names': joint_names,
             'retract_config': retract_config,
@@ -456,7 +455,7 @@ class CuroboConfigGenerator:
             'max_acceleration': 15.0,
         }
 
-        # Generate kinematics configuration
+        # 生成运动学配置
         kinematics_config = {
             'usd_path': None,
             'usd_robot_root': None,
@@ -471,7 +470,7 @@ class CuroboConfigGenerator:
             'cspace': cspace_config,
         }
 
-        # Generate self-collision configuration
+        # 生成自碰撞配置
         collision_spheres = self._generate_collision_spheres()
         collision_config = {
             'collision_spheres': collision_spheres,
@@ -481,7 +480,7 @@ class CuroboConfigGenerator:
             }
         }
 
-        # Complete configuration
+        # 完整配置
         config = {
             'robot_cfg': {
                 'kinematics': kinematics_config,
@@ -489,7 +488,7 @@ class CuroboConfigGenerator:
             }
         }
 
-        # Save if path provided
+        # 如果提供了路径则保存
         if output_path:
             with open(output_path, 'w') as f:
                 yaml.dump(config, f, default_flow_style=False, sort_keys=False)
@@ -497,11 +496,11 @@ class CuroboConfigGenerator:
         return config
 
     def _generate_collision_spheres(self) -> Dict[str, List[Dict]]:
-        """Generate basic collision spheres for each link."""
+        """为每个链接生成基本碰撞球"""
         spheres = {}
 
         for link in self.robot.links:
-            # Create basic spheres for each link
+            # 为每个链接创建基本球体
             spheres[link.name] = [
                 {'center': [0.0, 0.0, 0.0], 'radius': 0.05}
             ]
@@ -509,11 +508,11 @@ class CuroboConfigGenerator:
         return spheres
 
     def generate_ik_config(self) -> Dict[str, Any]:
-        """Generate IK solver configuration for cuRobo."""
+        """为 cuRobo 生成 IK 求解器配置"""
         chain_joints = self.robot.active_joints
         joint_names = [j.name for j in chain_joints]
 
-        # Build position and velocity limits
+        # 构建位置和速度限位
         position_lower = []
         position_upper = []
         velocity = []
@@ -549,15 +548,15 @@ class CuroboConfigGenerator:
 
 def load_urdf(urdf_path: str, base_link: str = "", ee_link: str = "") -> Tuple[RobotConfig, Dict]:
     """
-    Convenience function to load URDF and generate cuRobo config.
+    加载 URDF 并生成 cuRobo 配置的便捷函数
 
-    Args:
-        urdf_path: Path to URDF file
-        base_link: Optional base link name
-        ee_link: Optional end-effector link name
+    参数:
+        urdf_path: URDF 文件路径
+        base_link: 可选的基座链接名
+        ee_link: 可选的末端执行器链接名
 
-    Returns:
-        Tuple of (RobotConfig, cuRobo config dict)
+    返回:
+        (RobotConfig, cuRobo 配置字典) 元组
     """
     parser = URDFParser(urdf_path)
     robot_config = parser.parse(base_link, ee_link)

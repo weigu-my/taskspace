@@ -1,8 +1,8 @@
 """
-ARM Reachability Analysis Framework
+机械臂可达性分析框架
 
-A comprehensive framework for robotic arm reachability analysis using cuRobo
-with GPU-accelerated multi-seed IK solving, dexterity and manipulability metrics.
+基于 cuRobo 的通用机械臂可达性分析框架，支持 GPU 加速的多种子 IK 求解、
+灵活度分析和可操作度计算。
 """
 
 from .config import ReachabilityConfig, VoxelConfig, IKConfig

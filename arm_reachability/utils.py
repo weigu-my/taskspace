@@ -1,5 +1,5 @@
 """
-Utility functions for reachability analysis.
+可达性分析工具函数
 """
 
 import numpy as np
@@ -10,16 +10,16 @@ import torch
 def euler_to_quaternion(roll: float, pitch: float, yaw: float,
                         degrees: bool = True) -> np.ndarray:
     """
-    Convert Euler angles to quaternion (w, x, y, z format).
+    将欧拉角转换为四元数 (w, x, y, z 格式)
 
-    Args:
-        roll: Rotation around X axis
-        pitch: Rotation around Y axis
-        yaw: Rotation around Z axis
-        degrees: If True, angles are in degrees
+    参数:
+        roll: 绕 X 轴旋转
+        pitch: 绕 Y 轴旋转
+        yaw: 绕 Z 轴旋转
+        degrees: 如果为 True，角度单位为度
 
-    Returns:
-        Quaternion as numpy array [w, x, y, z]
+    返回:
+        四元数数组 [w, x, y, z]
     """
     if degrees:
         roll = np.radians(roll)
@@ -43,17 +43,17 @@ def euler_to_quaternion(roll: float, pitch: float, yaw: float,
 
 def quaternion_to_matrix(quat: np.ndarray) -> np.ndarray:
     """
-    Convert quaternion to 3x3 rotation matrix.
+    将四元数转换为 3x3 旋转矩阵
 
-    Args:
-        quat: Quaternion [w, x, y, z]
+    参数:
+        quat: 四元数 [w, x, y, z]
 
-    Returns:
-        3x3 rotation matrix
+    返回:
+        3x3 旋转矩阵
     """
     w, x, y, z = quat
 
-    # Normalize quaternion
+    # 归一化四元数
     norm = np.sqrt(w*w + x*x + y*y + z*z)
     w, x, y, z = w/norm, x/norm, y/norm, z/norm
 
@@ -78,13 +78,13 @@ def quaternion_to_matrix(quat: np.ndarray) -> np.ndarray:
 
 def generate_spherical_orientations(n: int) -> np.ndarray:
     """
-    Generate evenly distributed orientations on a sphere using Fibonacci lattice.
+    使用斐波那契格点生成球面上均匀分布的姿态
 
-    Args:
-        n: Number of orientations to generate
+    参数:
+        n: 要生成的姿态数量
 
-    Returns:
-        Array of quaternions [n, 4] in (w, x, y, z) format
+    返回:
+        四元数数组 [n, 4]，格式为 (w, x, y, z)
     """
     orientations = []
 
@@ -94,26 +94,26 @@ def generate_spherical_orientations(n: int) -> np.ndarray:
         theta = 2 * np.pi * i / golden_ratio
         phi = np.arccos(1 - 2 * (i + 0.5) / n)
 
-        # Convert spherical to direction vector
+        # 将球面坐标转换为方向向量
         x = np.sin(phi) * np.cos(theta)
         y = np.sin(phi) * np.sin(theta)
         z = np.cos(phi)
 
-        # Create rotation that aligns Z-axis with this direction
-        # Using rodrigues formula
+        # 创建将 Z 轴对齐到该方向的旋转
+        # 使用罗德里格斯公式
         z_axis = np.array([0, 0, 1])
         direction = np.array([x, y, z])
 
         if np.allclose(direction, z_axis):
             quat = np.array([1, 0, 0, 0])
         elif np.allclose(direction, -z_axis):
-            quat = np.array([0, 1, 0, 0])  # 180 degree rotation around X
+            quat = np.array([0, 1, 0, 0])  # 绕 X 轴旋转 180 度
         else:
             axis = np.cross(z_axis, direction)
             axis = axis / np.linalg.norm(axis)
             angle = np.arccos(np.clip(np.dot(z_axis, direction), -1, 1))
 
-            # Axis-angle to quaternion
+            # 轴角转四元数
             w = np.cos(angle / 2)
             xyz = axis * np.sin(angle / 2)
             quat = np.array([w, xyz[0], xyz[1], xyz[2]])
@@ -125,19 +125,19 @@ def generate_spherical_orientations(n: int) -> np.ndarray:
 
 def generate_random_orientations(n: int, seed: Optional[int] = None) -> np.ndarray:
     """
-    Generate random orientations uniformly distributed on SO(3).
+    在 SO(3) 上生成均匀分布的随机姿态
 
-    Args:
-        n: Number of orientations
-        seed: Random seed
+    参数:
+        n: 姿态数量
+        seed: 随机种子
 
-    Returns:
-        Array of quaternions [n, 4] in (w, x, y, z) format
+    返回:
+        四元数数组 [n, 4]，格式为 (w, x, y, z)
     """
     if seed is not None:
         np.random.seed(seed)
 
-    # Generate random quaternions using method from Shoemake
+    # 使用 Shoemake 方法生成随机四元数
     u1 = np.random.uniform(0, 1, n)
     u2 = np.random.uniform(0, 2 * np.pi, n)
     u3 = np.random.uniform(0, 2 * np.pi, n)
@@ -152,14 +152,14 @@ def generate_random_orientations(n: int, seed: Optional[int] = None) -> np.ndarr
 
 def batched_iterator(data: np.ndarray, batch_size: int):
     """
-    Iterate over data in batches.
+    按批次迭代数据
 
-    Args:
-        data: Array to iterate over
-        batch_size: Size of each batch
+    参数:
+        data: 要迭代的数组
+        batch_size: 每个批次的大小
 
-    Yields:
-        Batches of data
+    生成:
+        数据批次
     """
     n = len(data)
     for i in range(0, n, batch_size):
@@ -172,26 +172,26 @@ def compute_jacobian_numerical(
     epsilon: float = 1e-6
 ) -> np.ndarray:
     """
-    Compute Jacobian matrix numerically using finite differences.
+    使用有限差分数值计算雅可比矩阵
 
-    Args:
-        forward_kinematics_fn: Function that takes joint positions and returns [x, y, z, qw, qx, qy, qz]
-        joint_positions: Current joint positions [n_joints]
-        epsilon: Finite difference step size
+    参数:
+        forward_kinematics_fn: 接受关节位置并返回 [x, y, z, qw, qx, qy, qz] 的函数
+        joint_positions: 当前关节位置 [n_joints]
+        epsilon: 有限差分步长
 
-    Returns:
-        Jacobian matrix [6, n_joints]
+    返回:
+        雅可比矩阵 [6, n_joints]
     """
     n_joints = len(joint_positions)
     jacobian = np.zeros((6, n_joints))
 
-    # Get base pose
+    # 获取基准位姿
     base_pose = forward_kinematics_fn(joint_positions)
     base_pos = base_pose[:3]
     base_quat = base_pose[3:7]
 
     for i in range(n_joints):
-        # Perturb joint
+        # 扰动关节
         perturbed = joint_positions.copy()
         perturbed[i] += epsilon
 
@@ -199,20 +199,20 @@ def compute_jacobian_numerical(
         perturbed_pos = perturbed_pose[:3]
         perturbed_quat = perturbed_pose[3:7]
 
-        # Position Jacobian (linear velocity)
+        # 位置雅可比（线速度）
         jacobian[:3, i] = (perturbed_pos - base_pos) / epsilon
 
-        # Orientation Jacobian (angular velocity)
-        # Using quaternion difference to approximate angular velocity
+        # 姿态雅可比（角速度）
+        # 使用四元数差分近似角速度
         dq = quaternion_multiply(perturbed_quat, quaternion_inverse(base_quat))
-        # For small rotations, angular velocity ≈ 2 * imaginary part of quaternion / dt
+        # 对于小旋转，角速度 ≈ 2 * 四元数虚部 / dt
         jacobian[3:6, i] = 2 * dq[1:4] / epsilon
 
     return jacobian
 
 
 def quaternion_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
-    """Multiply two quaternions."""
+    """四元数乘法"""
     w1, x1, y1, z1 = q1
     w2, x2, y2, z2 = q2
 
@@ -225,7 +225,7 @@ def quaternion_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
 
 
 def quaternion_inverse(q: np.ndarray) -> np.ndarray:
-    """Compute quaternion inverse (conjugate for unit quaternions)."""
+    """计算四元数的逆（对于单位四元数即共轭）"""
     return np.array([q[0], -q[1], -q[2], -q[3]])
 
 
@@ -235,14 +235,14 @@ def create_pose_tensor(
     device: str = "cuda:0"
 ) -> torch.Tensor:
     """
-    Create pose tensor for cuRobo.
+    为 cuRobo 创建位姿张量
 
-    Args:
-        positions: Position array [n, 3]
-        orientations: Quaternion array [n, 4] in (w, x, y, z) format
+    参数:
+        positions: 位置数组 [n, 3]
+        orientations: 四元数数组 [n, 4]，格式为 (w, x, y, z)
 
-    Returns:
-        Pose tensor [n, 7] with (x, y, z, qw, qx, qy, qz)
+    返回:
+        位姿张量 [n, 7]，格式为 (x, y, z, qw, qx, qy, qz)
     """
     poses = np.concatenate([positions, orientations], axis=-1)
     return torch.tensor(poses, dtype=torch.float32, device=device)
@@ -250,45 +250,45 @@ def create_pose_tensor(
 
 def colormap_dexterity(dexterity: np.ndarray, vmin: float = 0, vmax: float = None) -> np.ndarray:
     """
-    Map dexterity values to RGB colors.
+    将灵活度值映射为 RGB 颜色
 
-    Low dexterity -> Blue
-    Medium dexterity -> Green/Yellow
-    High dexterity -> Red
+    低灵活度 -> 蓝色
+    中灵活度 -> 绿色/黄色
+    高灵活度 -> 红色
 
-    Args:
-        dexterity: Dexterity values
-        vmin: Minimum value for normalization
-        vmax: Maximum value for normalization
+    参数:
+        dexterity: 灵活度值
+        vmin: 归一化最小值
+        vmax: 归一化最大值
 
-    Returns:
-        RGB colors [n, 3]
+    返回:
+        RGB 颜色 [n, 3]
     """
     if vmax is None:
         vmax = np.max(dexterity) if len(dexterity) > 0 else 1
 
-    # Normalize to [0, 1]
+    # 归一化到 [0, 1]
     if vmax > vmin:
         normalized = np.clip((dexterity - vmin) / (vmax - vmin), 0, 1)
     else:
         normalized = np.zeros_like(dexterity)
 
-    # Create colormap (blue -> cyan -> green -> yellow -> red)
+    # 创建色图（蓝 -> 青 -> 绿 -> 黄 -> 红）
     colors = np.zeros((len(dexterity), 3))
 
     for i, val in enumerate(normalized):
         if val < 0.25:
             t = val / 0.25
-            colors[i] = [0, t, 1]  # Blue to Cyan
+            colors[i] = [0, t, 1]  # 蓝色到青色
         elif val < 0.5:
             t = (val - 0.25) / 0.25
-            colors[i] = [0, 1, 1 - t]  # Cyan to Green
+            colors[i] = [0, 1, 1 - t]  # 青色到绿色
         elif val < 0.75:
             t = (val - 0.5) / 0.25
-            colors[i] = [t, 1, 0]  # Green to Yellow
+            colors[i] = [t, 1, 0]  # 绿色到黄色
         else:
             t = (val - 0.75) / 0.25
-            colors[i] = [1, 1 - t, 0]  # Yellow to Red
+            colors[i] = [1, 1 - t, 0]  # 黄色到红色
 
     return colors
 
@@ -299,15 +299,15 @@ def size_from_manipulability(
     max_size: float = 20.0
 ) -> np.ndarray:
     """
-    Map manipulability values to point sizes.
+    将可操作度值映射为点大小
 
-    Args:
-        manipulability: Manipulability values
-        min_size: Minimum point size
-        max_size: Maximum point size
+    参数:
+        manipulability: 可操作度值
+        min_size: 最小点大小
+        max_size: 最大点大小
 
-    Returns:
-        Point sizes
+    返回:
+        点大小
     """
     if len(manipulability) == 0:
         return np.array([])
@@ -324,30 +324,38 @@ def size_from_manipulability(
 
 
 class ProgressBar:
-    """Simple progress bar for console output."""
+    """简单的控制台进度条"""
 
     def __init__(self, total: int, prefix: str = "", width: int = 50):
+        """
+        初始化进度条
+
+        参数:
+            total: 总步数
+            prefix: 前缀文本
+            width: 进度条宽度
+        """
         self.total = total
         self.prefix = prefix
         self.width = width
         self.current = 0
 
     def update(self, n: int = 1):
-        """Update progress by n steps."""
+        """更新进度（增加 n 步）"""
         self.current += n
         self._display()
 
     def _display(self):
-        """Display the progress bar."""
+        """显示进度条"""
         percent = self.current / self.total
         filled = int(self.width * percent)
         bar = '█' * filled + '░' * (self.width - filled)
         print(f'\r{self.prefix} |{bar}| {percent*100:.1f}% ({self.current}/{self.total})', end='', flush=True)
 
         if self.current >= self.total:
-            print()  # New line when complete
+            print()  # 完成时换行
 
     def close(self):
-        """Close the progress bar."""
+        """关闭进度条"""
         if self.current < self.total:
             print()
