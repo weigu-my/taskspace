@@ -1,8 +1,7 @@
 """
-Multi-seed IK Solver using cuRobo with GPU acceleration.
+多种子IK求解器 - 使用cuRobo实现GPU加速
 
-This module provides IK solving capabilities with multiple seeds to find
-multiple solutions for redundant manipulators.
+本模块提供基于多种子策略的IK求解功能，用于为冗余机械臂寻找多个IK解。
 """
 
 import os
@@ -18,34 +17,34 @@ from .urdf_parser import RobotConfig, CuroboConfigGenerator
 
 @dataclass
 class IKResult:
-    """Result of IK solving for a single target pose."""
-    target_position: np.ndarray       # [3]
-    target_orientation: np.ndarray    # [4] quaternion (w, x, y, z)
-    success: bool                     # Whether at least one solution was found
-    num_solutions: int                # Number of valid IK solutions found
-    solutions: np.ndarray             # [num_seeds, n_joints] joint configurations
-    solution_mask: np.ndarray         # [num_seeds] boolean mask of valid solutions
-    position_errors: np.ndarray       # [num_seeds] position errors
-    rotation_errors: np.ndarray       # [num_seeds] rotation errors
+    """单个目标位姿的IK求解结果"""
+    target_position: np.ndarray       # [3] 目标位置
+    target_orientation: np.ndarray    # [4] 目标姿态四元数 (w, x, y, z)
+    success: bool                     # 是否找到至少一个解
+    num_solutions: int                # 找到的有效IK解数量
+    solutions: np.ndarray             # [num_seeds, n_joints] 关节配置
+    solution_mask: np.ndarray         # [num_seeds] 有效解的布尔掩码
+    position_errors: np.ndarray       # [num_seeds] 位置误差
+    rotation_errors: np.ndarray       # [num_seeds] 旋转误差
 
 
 @dataclass
 class BatchIKResult:
-    """Result of batch IK solving."""
-    success_mask: np.ndarray          # [batch_size] whether each pose has at least one solution
-    num_solutions: np.ndarray         # [batch_size] number of solutions for each pose
-    best_solutions: np.ndarray        # [batch_size, n_joints] best solution for each pose
-    all_solutions: np.ndarray         # [batch_size, num_seeds, n_joints] all solutions
-    solution_masks: np.ndarray        # [batch_size, num_seeds] validity mask
-    solve_time: float                 # Total solving time
+    """批量IK求解结果"""
+    success_mask: np.ndarray          # [batch_size] 每个位姿是否有解
+    num_solutions: np.ndarray         # [batch_size] 每个位姿的解数量
+    best_solutions: np.ndarray        # [batch_size, n_joints] 最优关节配置
+    all_solutions: np.ndarray         # [batch_size, num_seeds, n_joints] 所有解
+    solution_masks: np.ndarray        # [batch_size, num_seeds] 有效性掩码
+    solve_time: float                 # 总求解时间
 
 
 class MultiSeedIKSolver:
     """
-    Multi-seed IK solver using cuRobo for GPU-accelerated computation.
+    多种子IK求解器 - 使用cuRobo进行GPU加速计算
 
-    This solver runs IK from multiple initial seeds to find multiple solutions,
-    which is essential for analyzing reachability of redundant manipulators.
+    该求解器从多个初始种子运行IK，以找到多个解，
+    这对于分析冗余机械臂的可达性至关重要。
     """
 
     def __init__(
@@ -55,42 +54,45 @@ class MultiSeedIKSolver:
         device: str = "cuda:0"
     ):
         """
-        Initialize the multi-seed IK solver.
+        初始化多种子IK求解器
 
-        Args:
-            robot_config: Robot configuration from URDF parser
-            ik_config: IK solver configuration
-            device: Torch device for computation
+        参数:
+            robot_config: 从URDF解析器获取的机器人配置
+            ik_config: IK求解器配置
+            device: 计算设备
         """
         self.robot_config = robot_config
         self.ik_config = ik_config
         self.device = device
         self.ik_solver = None
         self.tensor_args = None
+        self._current_batch_size = None  # 跟踪当前批次大小
 
         self._initialize_solver()
 
     def _initialize_solver(self):
-        """Initialize cuRobo IK solver."""
+        """初始化cuRobo IK求解器"""
         try:
             from curobo.types.base import TensorDeviceType
             from curobo.types.robot import RobotConfig as CuroboRobotConfig
             from curobo.wrap.reacher.ik_solver import IKSolver, IKSolverConfig
 
-            # Setup tensor arguments
+            # 设置张量参数
             self.tensor_args = TensorDeviceType(
                 device=torch.device(self.device),
                 dtype=torch.float32
             )
 
-            # Generate cuRobo configuration
+            # 生成cuRobo配置
             config_generator = CuroboConfigGenerator(self.robot_config)
             curobo_config = config_generator.generate()
 
-            # Create robot configuration for cuRobo
+            # 为cuRobo创建机器人配置
             robot_cfg = self._create_curobo_robot_config(curobo_config)
 
-            # Create IK solver configuration
+            # 创建IK求解器配置
+            # 注意: 禁用CUDA graph以避免批次大小变化时的错误
+            # CUDA graph 要求批次大小固定，但最后一个批次可能较小
             ik_solver_config = IKSolverConfig.load_from_robot_config(
                 robot_cfg=robot_cfg,
                 world_model=None,
@@ -98,7 +100,7 @@ class MultiSeedIKSolver:
                 num_seeds=self.ik_config.num_seeds,
                 position_threshold=self.ik_config.position_threshold,
                 rotation_threshold=self.ik_config.rotation_threshold,
-                use_cuda_graph=True,
+                use_cuda_graph=False,  # 禁用CUDA graph以支持可变批次大小
                 self_collision_check=self.ik_config.self_collision_check,
                 self_collision_opt=self.ik_config.self_collision_check,
             )
@@ -106,24 +108,24 @@ class MultiSeedIKSolver:
             self.ik_solver = IKSolver(ik_solver_config)
             self.n_joints = len(self.robot_config.active_joints)
 
-            print(f"[IK Solver] Initialized with {self.ik_config.num_seeds} seeds")
-            print(f"[IK Solver] Robot: {self.robot_config.name}, DOF: {self.n_joints}")
-            print(f"[IK Solver] Device: {self.device}")
+            print(f"[IK求解器] 已初始化，种子数: {self.ik_config.num_seeds}")
+            print(f"[IK求解器] 机器人: {self.robot_config.name}, 自由度: {self.n_joints}")
+            print(f"[IK求解器] 设备: {self.device}")
 
         except ImportError as e:
-            print(f"[Warning] cuRobo not available: {e}")
-            print("[Warning] Using fallback dummy solver")
+            print(f"[警告] cuRobo不可用: {e}")
+            print("[警告] 使用模拟求解器")
             self._initialize_dummy_solver()
 
     def _create_curobo_robot_config(self, config_dict: Dict) -> Any:
-        """Create cuRobo robot configuration from dictionary."""
+        """从字典创建cuRobo机器人配置"""
         from curobo.types.robot import RobotConfig as CuroboRobotConfig
 
-        # Get active joints
+        # 获取活动关节
         active_joints = self.robot_config.active_joints
         joint_names = [j.name for j in active_joints]
 
-        # Build joint limits
+        # 构建关节限位
         joint_limits = {
             'position': [
                 [j.lower_limit for j in active_joints],
@@ -132,7 +134,7 @@ class MultiSeedIKSolver:
             'velocity': [[j.velocity_limit for j in active_joints]],
         }
 
-        # Create configuration dictionary
+        # 创建配置字典
         robot_cfg_dict = {
             'kinematics': {
                 'urdf_path': self.robot_config.urdf_path,
@@ -156,10 +158,10 @@ class MultiSeedIKSolver:
         return robot_cfg
 
     def _initialize_dummy_solver(self):
-        """Initialize a dummy solver for testing without cuRobo."""
+        """初始化模拟求解器用于测试（无需cuRobo）"""
         self.ik_solver = None
         self.n_joints = len(self.robot_config.active_joints)
-        print("[Dummy Solver] Initialized for testing")
+        print("[模拟求解器] 已初始化用于测试")
 
     def solve_single(
         self,
@@ -167,21 +169,21 @@ class MultiSeedIKSolver:
         orientation: np.ndarray
     ) -> IKResult:
         """
-        Solve IK for a single target pose with multiple seeds.
+        为单个目标位姿求解IK（使用多种子）
 
-        Args:
-            position: Target position [3]
-            orientation: Target orientation quaternion [4] (w, x, y, z)
+        参数:
+            position: 目标位置 [3]
+            orientation: 目标姿态四元数 [4] (w, x, y, z)
 
-        Returns:
-            IKResult with all solutions found
+        返回:
+            包含所有找到解的IKResult
         """
         if self.ik_solver is None:
             return self._solve_single_dummy(position, orientation)
 
         from curobo.types.math import Pose
 
-        # Create goal pose
+        # 创建目标位姿
         goal_pose = Pose(
             position=torch.tensor(
                 position.reshape(1, 3),
@@ -195,14 +197,14 @@ class MultiSeedIKSolver:
             )
         )
 
-        # Solve IK
+        # 求解IK
         result = self.ik_solver.solve_batch(goal_pose)
 
-        # Extract results
+        # 提取结果
         success = result.success.cpu().numpy()[0]
         solutions = result.solution.cpu().numpy()[0]  # [num_seeds, n_joints]
 
-        # Get position and rotation errors for all seeds
+        # 获取所有种子的位置和旋转误差
         if hasattr(result, 'position_error') and result.position_error is not None:
             position_errors = result.position_error.cpu().numpy().flatten()
         else:
@@ -213,7 +215,7 @@ class MultiSeedIKSolver:
         else:
             rotation_errors = np.zeros(self.ik_config.num_seeds)
 
-        # Create solution mask based on error thresholds
+        # 根据误差阈值创建解的有效性掩码
         solution_mask = (
             (position_errors < self.ik_config.position_threshold) &
             (rotation_errors < self.ik_config.rotation_threshold)
@@ -237,8 +239,8 @@ class MultiSeedIKSolver:
         position: np.ndarray,
         orientation: np.ndarray
     ) -> IKResult:
-        """Dummy solver for testing."""
-        # Simulate random results
+        """用于测试的模拟求解器"""
+        # 模拟随机结果
         success = np.random.random() > 0.3
         num_solutions = np.random.randint(0, self.ik_config.num_seeds // 2) if success else 0
 
@@ -268,15 +270,15 @@ class MultiSeedIKSolver:
         return_all_solutions: bool = True
     ) -> BatchIKResult:
         """
-        Solve IK for a batch of target poses with GPU acceleration.
+        使用GPU加速批量求解IK
 
-        Args:
-            positions: Target positions [batch_size, 3]
-            orientations: Target orientation quaternions [batch_size, 4] (w, x, y, z)
-            return_all_solutions: If True, return all solutions from all seeds
+        参数:
+            positions: 目标位置 [batch_size, 3]
+            orientations: 目标姿态四元数 [batch_size, 4] (w, x, y, z)
+            return_all_solutions: 如果为True，返回所有种子的解
 
-        Returns:
-            BatchIKResult with solutions for all poses
+        返回:
+            包含所有位姿解的BatchIKResult
         """
         start_time = time.time()
         batch_size = len(positions)
@@ -286,7 +288,7 @@ class MultiSeedIKSolver:
 
         from curobo.types.math import Pose
 
-        # Create goal poses
+        # 创建目标位姿
         goal_pose = Pose(
             position=torch.tensor(
                 positions,
@@ -300,23 +302,23 @@ class MultiSeedIKSolver:
             )
         )
 
-        # Solve IK batch
+        # 批量求解IK
         result = self.ik_solver.solve_batch(goal_pose)
 
-        # Extract results
+        # 提取结果
         success_mask = result.success.cpu().numpy()
         solutions = result.solution.cpu().numpy()  # [batch_size, num_seeds, n_joints]
 
-        # Best solution for each pose (first successful seed)
-        best_solutions = solutions[:, 0, :]  # Take first seed as best
+        # 每个位姿的最优解（取第一个成功的种子）
+        best_solutions = solutions[:, 0, :]  # 取第一个种子作为最优解
 
-        # Count solutions per pose
+        # 统计每个位姿的解数量
         num_solutions = np.zeros(batch_size, dtype=np.int32)
 
-        # Solution validity mask
+        # 解的有效性掩码
         solution_masks = np.zeros((batch_size, self.ik_config.num_seeds), dtype=bool)
 
-        # For positions that succeeded, count all valid seeds
+        # 对于成功的位置，统计所有有效种子
         if hasattr(result, 'position_error') and result.position_error is not None:
             position_errors = result.position_error.cpu().numpy()
             rotation_errors = result.rotation_error.cpu().numpy() if hasattr(result, 'rotation_error') else np.zeros_like(position_errors)
@@ -329,7 +331,7 @@ class MultiSeedIKSolver:
                 solution_masks[i] = valid
                 num_solutions[i] = np.sum(valid)
         else:
-            # Use success mask to estimate solutions
+            # 使用成功掩码估计解数量
             num_solutions = success_mask.astype(np.int32)
             solution_masks[:, 0] = success_mask
 
@@ -350,11 +352,11 @@ class MultiSeedIKSolver:
         orientations: np.ndarray,
         return_all_solutions: bool
     ) -> BatchIKResult:
-        """Dummy batch solver for testing."""
+        """用于测试的模拟批量求解器"""
         start_time = time.time()
         batch_size = len(positions)
 
-        # Simulate results based on distance from origin
+        # 根据与原点的距离模拟结果
         distances = np.linalg.norm(positions, axis=1)
         success_prob = np.clip(1.0 - distances / 2.0, 0.1, 0.9)
         success_mask = np.random.random(batch_size) < success_prob
@@ -400,45 +402,44 @@ class MultiSeedIKSolver:
         batch_size: int = 1024
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Solve IK for multiple positions with multiple orientations.
+        为多个位置和多个姿态求解IK
 
-        This is the main method for reachability analysis, testing each
-        position with multiple orientations.
+        这是可达性分析的主要方法，测试每个位置的多个姿态。
 
-        Args:
-            positions: Grid positions [n_positions, 3]
-            orientations: Orientations to test [n_orientations, 4]
-            batch_size: Batch size for GPU processing
+        参数:
+            positions: 网格位置 [n_positions, 3]
+            orientations: 要测试的姿态 [n_orientations, 4]
+            batch_size: GPU批处理大小
 
-        Returns:
-            Tuple of:
-                - reachable_mask: [n_positions] True if any orientation succeeds
-                - dexterity: [n_positions] number of reachable orientations
-                - num_solutions: [n_positions, n_orientations] solutions per pose
+        返回:
+            元组包含:
+                - reachable_mask: [n_positions] 任意姿态成功则为True
+                - dexterity: [n_positions] 可达姿态数量
+                - num_solutions: [n_positions, n_orientations] 每个位姿的解数量
         """
         n_positions = len(positions)
         n_orientations = len(orientations)
 
-        print(f"[IK Solver] Testing {n_positions} positions × {n_orientations} orientations")
-        print(f"[IK Solver] Total poses: {n_positions * n_orientations}")
+        print(f"[IK求解器] 测试 {n_positions} 个位置 × {n_orientations} 个姿态")
+        print(f"[IK求解器] 总位姿数: {n_positions * n_orientations}")
 
-        # Create all position-orientation combinations
+        # 创建所有位置-姿态组合
         # positions: [n_positions, 3] -> [n_positions, n_orientations, 3]
         # orientations: [n_orientations, 4] -> [n_positions, n_orientations, 4]
         pos_expanded = np.tile(positions[:, np.newaxis, :], (1, n_orientations, 1))
         ori_expanded = np.tile(orientations[np.newaxis, :, :], (n_positions, 1, 1))
 
-        # Flatten for batch processing
+        # 展平用于批处理
         all_positions = pos_expanded.reshape(-1, 3)
         all_orientations = ori_expanded.reshape(-1, 4)
         total_poses = len(all_positions)
 
-        # Process in batches
+        # 分批处理
         all_success = []
         all_num_solutions = []
 
         num_batches = (total_poses + batch_size - 1) // batch_size
-        print(f"[IK Solver] Processing {num_batches} batches...")
+        print(f"[IK求解器] 处理 {num_batches} 个批次...")
 
         for i in range(0, total_poses, batch_size):
             end_idx = min(i + batch_size, total_poses)
@@ -454,50 +455,50 @@ class MultiSeedIKSolver:
             all_success.append(result.success_mask)
             all_num_solutions.append(result.num_solutions)
 
-            # Progress
+            # 显示进度
             progress = (i + batch_size) / total_poses * 100
-            print(f"\r[IK Solver] Progress: {min(progress, 100):.1f}%", end='', flush=True)
+            print(f"\r[IK求解器] 进度: {min(progress, 100):.1f}%", end='', flush=True)
 
-        print()  # New line
+        print()  # 换行
 
-        # Concatenate results
+        # 合并结果
         success = np.concatenate(all_success)
         num_solutions = np.concatenate(all_num_solutions)
 
-        # Reshape to [n_positions, n_orientations]
+        # 重塑为 [n_positions, n_orientations]
         success_grid = success.reshape(n_positions, n_orientations)
         num_solutions_grid = num_solutions.reshape(n_positions, n_orientations)
 
-        # Compute per-position metrics
+        # 计算每个位置的指标
         reachable_mask = np.any(success_grid, axis=1)
         dexterity = np.sum(success_grid, axis=1)
 
-        print(f"[IK Solver] Reachable positions: {np.sum(reachable_mask)} / {n_positions}")
-        print(f"[IK Solver] Max dexterity: {np.max(dexterity)}")
+        print(f"[IK求解器] 可达位置: {np.sum(reachable_mask)} / {n_positions}")
+        print(f"[IK求解器] 最大灵活度: {np.max(dexterity)}")
 
         return reachable_mask, dexterity, num_solutions_grid
 
     def get_forward_kinematics(self, joint_positions: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Compute forward kinematics for given joint positions.
+        计算给定关节位置的正运动学
 
-        Args:
-            joint_positions: Joint positions [batch_size, n_joints]
+        参数:
+            joint_positions: 关节位置 [batch_size, n_joints]
 
-        Returns:
-            Tuple of:
-                - positions: End-effector positions [batch_size, 3]
-                - orientations: End-effector orientations [batch_size, 4]
+        返回:
+            元组包含:
+                - positions: 末端执行器位置 [batch_size, 3]
+                - orientations: 末端执行器姿态 [batch_size, 4]
         """
         if self.ik_solver is None:
-            # Dummy FK
+            # 模拟FK
             batch_size = len(joint_positions)
             positions = np.random.uniform(-1, 1, (batch_size, 3)).astype(np.float32)
             orientations = np.zeros((batch_size, 4), dtype=np.float32)
-            orientations[:, 0] = 1.0  # w = 1 for identity quaternion
+            orientations[:, 0] = 1.0  # w = 1 表示单位四元数
             return positions, orientations
 
-        # Use cuRobo kinematics
+        # 使用cuRobo运动学
         q = torch.tensor(
             joint_positions,
             dtype=torch.float32,
@@ -513,17 +514,17 @@ class MultiSeedIKSolver:
 
     def sample_workspace(self, n_samples: int = 10000) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Sample the robot's workspace using random FK sampling.
+        使用随机FK采样机器人的工作空间
 
-        Args:
-            n_samples: Number of random joint configurations to sample
+        参数:
+            n_samples: 要采样的随机关节配置数量
 
-        Returns:
-            Tuple of:
-                - positions: Sampled end-effector positions [n_samples, 3]
-                - joint_configs: Corresponding joint configurations [n_samples, n_joints]
+        返回:
+            元组包含:
+                - positions: 采样的末端执行器位置 [n_samples, 3]
+                - joint_configs: 对应的关节配置 [n_samples, n_joints]
         """
-        # Generate random joint configurations within limits
+        # 在限位范围内生成随机关节配置
         active_joints = self.robot_config.active_joints
         joint_configs = np.zeros((n_samples, self.n_joints), dtype=np.float32)
 
@@ -534,7 +535,7 @@ class MultiSeedIKSolver:
                 n_samples
             )
 
-        # Compute FK
+        # 计算FK
         positions, _ = self.get_forward_kinematics(joint_configs)
 
         return positions, joint_configs
@@ -545,23 +546,23 @@ class MultiSeedIKSolver:
         padding: float = 0.1
     ) -> Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]:
         """
-        Estimate workspace bounds using FK sampling.
+        使用FK采样估计工作空间边界
 
-        Args:
-            n_samples: Number of samples for estimation
-            padding: Padding ratio to add to bounds
+        参数:
+            n_samples: 用于估计的样本数量
+            padding: 添加到边界的填充比例
 
-        Returns:
-            Tuple of (x_range, y_range, z_range) as (min, max) tuples
+        返回:
+            (x_range, y_range, z_range) 元组，每个为 (min, max) 元组
         """
-        print(f"[IK Solver] Estimating workspace bounds with {n_samples} FK samples...")
+        print(f"[IK求解器] 使用 {n_samples} 个FK样本估计工作空间边界...")
 
         positions, _ = self.sample_workspace(n_samples)
 
         x_min, y_min, z_min = positions.min(axis=0)
         x_max, y_max, z_max = positions.max(axis=0)
 
-        # Add padding
+        # 添加填充
         x_pad = (x_max - x_min) * padding
         y_pad = (y_max - y_min) * padding
         z_pad = (z_max - z_min) * padding
@@ -570,7 +571,7 @@ class MultiSeedIKSolver:
         y_range = (y_min - y_pad, y_max + y_pad)
         z_range = (z_min - z_pad, z_max + z_pad)
 
-        print(f"[IK Solver] Estimated bounds:")
+        print(f"[IK求解器] 估计边界:")
         print(f"  X: [{x_range[0]:.3f}, {x_range[1]:.3f}]")
         print(f"  Y: [{y_range[0]:.3f}, {y_range[1]:.3f}]")
         print(f"  Z: [{z_range[0]:.3f}, {z_range[1]:.3f}]")

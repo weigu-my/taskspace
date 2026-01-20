@@ -1,5 +1,7 @@
 """
-Configuration classes for reachability analysis.
+可达性分析配置类
+
+定义了体素网格、IK求解器、姿态采样等配置参数。
 """
 
 from dataclasses import dataclass, field
@@ -9,34 +11,34 @@ import numpy as np
 
 
 class OrientationMode(Enum):
-    """Orientation sampling modes for reachability analysis."""
-    FIXED = "fixed"                # Single fixed orientation
-    MULTI_FIXED = "multi_fixed"    # Multiple predefined orientations
-    SPHERICAL = "spherical"        # Spherical sampling
-    RANDOM = "random"              # Random orientations
+    """姿态采样模式"""
+    FIXED = "fixed"                # 单一固定姿态
+    MULTI_FIXED = "multi_fixed"    # 多个预定义姿态
+    SPHERICAL = "spherical"        # 球面均匀采样
+    RANDOM = "random"              # 随机姿态
 
 
 @dataclass
 class VoxelConfig:
-    """Configuration for voxel-based workspace sampling."""
+    """体素网格配置 - 用于工作空间采样"""
 
-    # Workspace bounds [min, max] for x, y, z (meters)
+    # 工作空间边界 [最小值, 最大值]，单位：米
     x_range: Tuple[float, float] = (-1.0, 1.0)
     y_range: Tuple[float, float] = (-1.0, 1.0)
     z_range: Tuple[float, float] = (0.0, 1.5)
 
-    # Voxel resolution (meters)
+    # 体素分辨率（米）
     resolution: float = 0.05
 
-    # Auto-detect workspace from FK sampling
+    # 是否自动检测工作空间（通过FK采样）
     auto_detect: bool = True
 
-    # FK sampling parameters for auto-detection
+    # FK采样参数（用于自动检测）
     fk_samples: int = 10000
-    padding: float = 0.1  # Padding ratio for detected bounds
+    padding: float = 0.1  # 边界填充比例
 
     def get_grid_points(self) -> np.ndarray:
-        """Generate voxel grid points."""
+        """生成体素网格中心点"""
         x = np.arange(self.x_range[0], self.x_range[1] + self.resolution, self.resolution)
         y = np.arange(self.y_range[0], self.y_range[1] + self.resolution, self.resolution)
         z = np.arange(self.z_range[0], self.z_range[1] + self.resolution, self.resolution)
@@ -47,7 +49,7 @@ class VoxelConfig:
         return points.astype(np.float32)
 
     def get_grid_shape(self) -> Tuple[int, int, int]:
-        """Get the shape of the voxel grid."""
+        """获取体素网格形状"""
         nx = int(np.ceil((self.x_range[1] - self.x_range[0]) / self.resolution)) + 1
         ny = int(np.ceil((self.y_range[1] - self.y_range[0]) / self.resolution)) + 1
         nz = int(np.ceil((self.z_range[1] - self.z_range[0]) / self.resolution)) + 1
@@ -56,96 +58,96 @@ class VoxelConfig:
 
 @dataclass
 class IKConfig:
-    """Configuration for multi-seed IK solving."""
+    """IK求解器配置 - 用于多种子IK求解"""
 
-    # Number of IK seeds (for finding multiple solutions)
+    # IK种子数量（用于寻找多个解）
     num_seeds: int = 32
 
-    # IK solver parameters
-    position_threshold: float = 0.005  # meters
-    rotation_threshold: float = 0.05   # radians
+    # IK求解精度阈值
+    position_threshold: float = 0.005  # 位置误差阈值（米）
+    rotation_threshold: float = 0.05   # 旋转误差阈值（弧度）
 
-    # cuRobo IK solver settings
+    # cuRobo IK求解器设置
     num_graph_seeds: int = 12
     num_trajopt_seeds: int = 8
 
-    # Batch size for GPU processing
+    # GPU批处理大小
     batch_size: int = 1024
 
-    # Maximum iterations
+    # 最大迭代次数
     max_iterations: int = 100
 
-    # Use parallel environment for batch solving
+    # 是否使用并行环境批量求解
     use_parallel_env: bool = True
 
-    # Collision checking
+    # 碰撞检测
     collision_check: bool = True
     self_collision_check: bool = True
 
 
 @dataclass
 class OrientationConfig:
-    """Configuration for orientation sampling."""
+    """姿态采样配置"""
 
     mode: OrientationMode = OrientationMode.MULTI_FIXED
 
-    # For FIXED mode: single quaternion [w, x, y, z]
+    # FIXED模式：单个四元数 [w, x, y, z]
     fixed_orientation: List[float] = field(default_factory=lambda: [1.0, 0.0, 0.0, 0.0])
 
-    # For MULTI_FIXED mode: list of Euler angles [roll, pitch, yaw] in degrees
+    # MULTI_FIXED模式：多个欧拉角 [roll, pitch, yaw]，单位：度
     multi_orientations_euler: List[List[float]] = field(default_factory=lambda: [
-        [0, 0, 0],       # Pointing down (Z-)
-        [180, 0, 0],     # Pointing up (Z+)
-        [90, 0, 0],      # Pointing forward (X+)
-        [-90, 0, 0],     # Pointing backward (X-)
-        [0, 90, 0],      # Pointing left (Y+)
-        [0, -90, 0],     # Pointing right (Y-)
+        [0, 0, 0],       # Z轴向下
+        [180, 0, 0],     # Z轴向上
+        [90, 0, 0],      # X轴向前
+        [-90, 0, 0],     # X轴向后
+        [0, 90, 0],      # Y轴向左
+        [0, -90, 0],     # Y轴向右
     ])
 
-    # For SPHERICAL mode: number of orientations to sample
-    num_spherical_samples: int = 26  # Icosahedron vertices + face centers
+    # SPHERICAL模式：球面采样数量
+    num_spherical_samples: int = 26  # 二十面体顶点+面心
 
-    # For RANDOM mode: number of random orientations
+    # RANDOM模式：随机姿态数量
     num_random_samples: int = 10
 
 
 @dataclass
 class ReachabilityConfig:
-    """Main configuration for reachability analysis."""
+    """可达性分析主配置"""
 
-    # URDF file path
+    # URDF文件路径
     urdf_path: str = ""
 
-    # End-effector link name (auto-detect if empty)
+    # 末端执行器链接名（为空则自动检测）
     ee_link: str = ""
 
-    # Base link name (auto-detect if empty)
+    # 基座链接名（为空则自动检测）
     base_link: str = ""
 
-    # Voxel configuration
+    # 体素配置
     voxel: VoxelConfig = field(default_factory=VoxelConfig)
 
-    # IK configuration
+    # IK配置
     ik: IKConfig = field(default_factory=IKConfig)
 
-    # Orientation configuration
+    # 姿态配置
     orientation: OrientationConfig = field(default_factory=OrientationConfig)
 
-    # Output directory
+    # 输出目录
     output_dir: str = "./reachability_output"
 
-    # Device for computation
+    # 计算设备
     device: str = "cuda:0"
 
-    # Whether to compute manipulability
+    # 是否计算可操作度
     compute_manipulability: bool = True
 
-    # Verbose output
+    # 详细输出
     verbose: bool = True
 
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "ReachabilityConfig":
-        """Load configuration from YAML file."""
+        """从YAML文件加载配置"""
         import yaml
         with open(yaml_path, 'r') as f:
             data = yaml.safe_load(f)
@@ -167,7 +169,7 @@ class ReachabilityConfig:
         if 'verbose' in data:
             config.verbose = data['verbose']
 
-        # Voxel config
+        # 体素配置
         if 'voxel' in data:
             v = data['voxel']
             if 'x_range' in v:
@@ -185,7 +187,7 @@ class ReachabilityConfig:
             if 'padding' in v:
                 config.voxel.padding = v['padding']
 
-        # IK config
+        # IK配置
         if 'ik' in data:
             ik = data['ik']
             if 'num_seeds' in ik:
@@ -203,7 +205,7 @@ class ReachabilityConfig:
             if 'self_collision_check' in ik:
                 config.ik.self_collision_check = ik['self_collision_check']
 
-        # Orientation config
+        # 姿态配置
         if 'orientation' in data:
             o = data['orientation']
             if 'mode' in o:
@@ -220,7 +222,7 @@ class ReachabilityConfig:
         return config
 
     def to_yaml(self, yaml_path: str):
-        """Save configuration to YAML file."""
+        """保存配置到YAML文件"""
         import yaml
 
         data = {
