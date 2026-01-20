@@ -1,0 +1,131 @@
+# =============================================================================
+# 机械臂可达性分析框架 - Docker Compose 配置
+# =============================================================================
+# 使用方式:
+#   构建镜像: docker-compose build
+#   启动服务: docker-compose up -d
+#   查看日志: docker-compose logs -f
+#   停止服务: docker-compose down
+# =============================================================================
+
+version: '3.8'
+
+services:
+  # ---------------------------------------------------------------------------
+  # 主服务：可达性分析（支持 GPU）
+  # ---------------------------------------------------------------------------
+  reachability:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: arm-reachability:latest
+    container_name: arm-reachability
+
+    # GPU 支持（需要 nvidia-docker2）
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    # 环境变量
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+      - CUDA_VISIBLE_DEVICES=0
+      - MUJOCO_GL=osmesa
+      - PYOPENGL_PLATFORM=osmesa
+      - JUPYTER_ALLOW_INSECURE_WRITES=true
+
+    # 端口映射
+    ports:
+      - "8888:8888"   # Jupyter Lab
+      - "7000:7000"   # Meshcat 可视化
+      - "8050:8050"   # Plotly Dash（可选）
+
+    # 挂载卷
+    volumes:
+      # 项目代码（开发模式，实时同步）
+      - .:/workspace
+      # 数据持久化
+      - reachability_data:/workspace/data
+      # URDF 文件（可选，挂载外部 URDF）
+      - ./urdf:/workspace/urdf:ro
+      # 输出结果
+      - ./output:/workspace/output
+
+    # 工作目录
+    working_dir: /workspace
+
+    # 保持容器运行
+    stdin_open: true
+    tty: true
+
+    # 重启策略
+    restart: unless-stopped
+
+    # 网络
+    networks:
+      - reachability-network
+
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "python", "-c", "import torch; print(torch.cuda.is_available())"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ---------------------------------------------------------------------------
+  # 可选服务：仅 CPU 版本（无 GPU 支持）
+  # ---------------------------------------------------------------------------
+  reachability-cpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    image: arm-reachability-cpu:latest
+    container_name: arm-reachability-cpu
+
+    profiles:
+      - cpu-only  # 需要显式启用: docker-compose --profile cpu-only up
+
+    environment:
+      - MUJOCO_GL=osmesa
+      - PYOPENGL_PLATFORM=osmesa
+      - JUPYTER_ALLOW_INSECURE_WRITES=true
+
+    ports:
+      - "8889:8888"   # Jupyter Lab（不同端口避免冲突）
+      - "7001:7000"   # Meshcat
+
+    volumes:
+      - .:/workspace
+      - reachability_data_cpu:/workspace/data
+      - ./urdf:/workspace/urdf:ro
+      - ./output:/workspace/output
+
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+    networks:
+      - reachability-network
+
+# -----------------------------------------------------------------------------
+# 网络配置
+# -----------------------------------------------------------------------------
+networks:
+  reachability-network:
+    driver: bridge
+
+# -----------------------------------------------------------------------------
+# 数据卷
+# -----------------------------------------------------------------------------
+volumes:
+  reachability_data:
+    driver: local
+  reachability_data_cpu:
+    driver: local
