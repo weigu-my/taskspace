@@ -37,6 +37,8 @@ class LinkInfo:
     collision_mesh: Optional[str] = None
     visual_origin: Optional[List[float]] = None
     collision_origin: Optional[List[float]] = None
+    visual_scale: Optional[List[float]] = None
+    collision_scale: Optional[List[float]] = None
 
 
 @dataclass
@@ -70,8 +72,11 @@ class URDFParser:
         'tcp', 'flange', 'wrist', 'link_6', 'link_7', 'link6', 'link7'
     ]
 
-    # Keywords to identify base links
-    BASE_KEYWORDS = ['base', 'world', 'root', 'link_0', 'link0', 'base_link']
+    # Keywords to identify base links (higher priority first)
+    BASE_KEYWORDS = ['base_link', 'base', 'root', 'link_0', 'link0', 'world']
+
+    # Links that often serve as an external world frame
+    WORLD_LIKE = {'world', 'map', 'odom'}
 
     def __init__(self, urdf_path: str):
         """
@@ -187,6 +192,8 @@ class URDFParser:
         collision_mesh = None
         visual_origin = None
         collision_origin = None
+        visual_scale = None
+        collision_scale = None
 
         # Parse visual
         visual_elem = link_elem.find('visual')
@@ -196,6 +203,12 @@ class URDFParser:
                 mesh = geometry.find('mesh')
                 if mesh is not None:
                     visual_mesh = mesh.get('filename', '')
+                    scale_str = mesh.get('scale')
+                    if scale_str:
+                        try:
+                            visual_scale = [float(x) for x in scale_str.split()]
+                        except Exception:
+                            visual_scale = None
 
             origin = visual_elem.find('origin')
             if origin is not None:
@@ -211,6 +224,12 @@ class URDFParser:
                 mesh = geometry.find('mesh')
                 if mesh is not None:
                     collision_mesh = mesh.get('filename', '')
+                    scale_str = mesh.get('scale')
+                    if scale_str:
+                        try:
+                            collision_scale = [float(x) for x in scale_str.split()]
+                        except Exception:
+                            collision_scale = None
 
             origin = collision_elem.find('origin')
             if origin is not None:
@@ -223,7 +242,9 @@ class URDFParser:
             visual_mesh=visual_mesh,
             collision_mesh=collision_mesh,
             visual_origin=visual_origin,
-            collision_origin=collision_origin
+            collision_origin=collision_origin,
+            visual_scale=visual_scale,
+            collision_scale=collision_scale
         )
 
     def detect_base_link(self, joints: List[JointInfo], links: List[LinkInfo]) -> str:
@@ -233,6 +254,28 @@ class URDFParser:
         # Find links that are only parents (not children of any joint)
         child_links = {j.child_link for j in joints}
         root_links = link_names - child_links
+
+        # Special-case: many URDFs have a dummy 'world' root and a fixed joint to the real base.
+        # Example (AR5): world --(fixed)--> <robot_base>
+        # In this case, we want <robot_base> as base_link so analysis is centered at the robot base.
+        if root_links:
+            world_roots = [l for l in root_links if l.lower() in self.WORLD_LIKE]
+            if world_roots:
+                # Prefer children of fixed joints coming out of world-like roots
+                candidates = []
+                for j in joints:
+                    if j.parent_link.lower() in self.WORLD_LIKE and j.type == 'fixed':
+                        if j.child_link in link_names:
+                            candidates.append(j.child_link)
+
+                if candidates:
+                    # Prefer names that look like base/base_link
+                    for cand in candidates:
+                        cand_lower = cand.lower()
+                        if 'base_link' in cand_lower or cand_lower.endswith('base') or 'base' in cand_lower:
+                            return cand
+                    # Otherwise pick the first candidate deterministically
+                    return sorted(candidates)[0]
 
         # Check root links for base keywords
         for link in root_links:

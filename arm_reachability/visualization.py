@@ -26,6 +26,7 @@ class MeshData:
     faces: np.ndarray
     link_name: str
     transform: np.ndarray  # 4x4 transformation matrix
+    scale: Optional[np.ndarray] = None  # (3,) mesh scale
 
 
 class URDFMeshLoader:
@@ -101,12 +102,30 @@ class URDFMeshLoader:
                     os.path.join(self.urdf_dir, '..', relative_path),
                     os.path.join(self.urdf_dir, '..', '..', package_name, relative_path),
                     os.path.join(self.urdf_dir, relative_path),
+                    os.path.join(self.urdf_dir, package_name, relative_path),
+                    os.path.join(self.urdf_dir, '..', package_name, relative_path),
+                    # Try searching in current directory and subdirectories
+                    os.path.join(os.path.dirname(self.urdf_dir), package_name, relative_path),
+                    os.path.join(os.path.dirname(os.path.dirname(self.urdf_dir)), package_name, relative_path),
                 ]
 
                 for path in search_paths:
                     resolved = os.path.abspath(path)
                     if os.path.exists(resolved):
                         return resolved
+                
+                # Last resort: try to find meshes directory near URDF
+                # Look for meshes directory in parent directories
+                current_dir = self.urdf_dir
+                for _ in range(3):  # Search up to 3 levels up
+                    meshes_dir = os.path.join(current_dir, 'meshes')
+                    if os.path.exists(meshes_dir):
+                        # Extract just the filename from relative_path
+                        mesh_basename = os.path.basename(relative_path)
+                        potential_path = os.path.join(meshes_dir, mesh_basename)
+                        if os.path.exists(potential_path):
+                            return potential_path
+                    current_dir = os.path.dirname(current_dir)
 
             return None
 
@@ -174,6 +193,8 @@ class URDFMeshLoader:
             List of MeshData objects
         """
         meshes = []
+        loaded_count = 0
+        failed_count = 0
 
         # Get transforms for each link using FK
         link_transforms = self._compute_link_transforms(robot_config, joint_positions)
@@ -181,20 +202,27 @@ class URDFMeshLoader:
         for link in robot_config.links:
             # Try visual mesh first, then collision mesh
             mesh_filename = link.visual_mesh or link.collision_mesh
+            mesh_scale = link.visual_scale if link.visual_mesh else link.collision_scale
 
             if not mesh_filename:
                 continue
 
             mesh_path = self.resolve_mesh_path(mesh_filename)
             if not mesh_path:
-                print(f"[Warning] Could not resolve mesh: {mesh_filename}")
+                failed_count += 1
+                if failed_count <= 5:  # Only print first 5 warnings to avoid spam
+                    print(f"[Warning] Could not resolve mesh: {mesh_filename}")
                 continue
 
             result = self.load_mesh(mesh_path)
             if result is None:
+                failed_count += 1
+                if failed_count <= 5:
+                    print(f"[Warning] Failed to load mesh: {mesh_path}")
                 continue
 
             vertices, faces = result
+            loaded_count += 1
 
             # Get transform for this link
             transform = link_transforms.get(link.name, np.eye(4))
@@ -208,9 +236,11 @@ class URDFMeshLoader:
                 vertices=vertices,
                 faces=faces,
                 link_name=link.name,
-                transform=transform
+                transform=transform,
+                scale=np.array(mesh_scale, dtype=np.float32) if mesh_scale else None
             ))
 
+        print(f"[MeshLoader] Loaded {loaded_count} meshes, {failed_count} failed")
         return meshes
 
     def _compute_link_transforms(
@@ -403,11 +433,20 @@ class ReachabilityVisualizer:
 
         # Add robot meshes
         if show_robot:
+            print(f"[Visualization] Loading robot meshes from {self.robot_config.urdf_path}...")
             meshes = self.mesh_loader.load_robot_meshes(self.robot_config)
+            
+            if len(meshes) == 0:
+                print(f"[Warning] No meshes loaded! Robot model will not be visible in visualization.")
+                print(f"[Warning] Check that mesh files exist and paths are correct in URDF.")
+            else:
+                print(f"[Visualization] Adding {len(meshes)} mesh(es) to visualization...")
 
             for mesh_data in meshes:
                 # Transform vertices
                 vertices = mesh_data.vertices
+                if mesh_data.scale is not None:
+                    vertices = vertices * mesh_data.scale.reshape(1, 3)
                 ones = np.ones((len(vertices), 1))
                 vertices_h = np.hstack([vertices, ones])
                 transformed = (mesh_data.transform @ vertices_h.T).T[:, :3]

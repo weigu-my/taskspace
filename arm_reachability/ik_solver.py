@@ -562,14 +562,32 @@ class MultiSeedIKSolver:
         x_min, y_min, z_min = positions.min(axis=0)
         x_max, y_max, z_max = positions.max(axis=0)
 
-        # 添加填充
-        x_pad = (x_max - x_min) * padding
-        y_pad = (y_max - y_min) * padding
-        z_pad = (z_max - z_min) * padding
+        # ============================
+        # 边界策略说明
+        # - x/y：以 base_link 为中心(0,0)对称更直观，也避免出现“原点在 base 但范围偏一边”
+        # - z：通常机械臂主要在 base 上方工作，保留非对称边界，但至少覆盖 z=0
+        # ============================
+        x_abs = float(max(abs(x_min), abs(x_max)))
+        y_abs = float(max(abs(y_min), abs(y_max)))
 
-        x_range = (x_min - x_pad, x_max + x_pad)
-        y_range = (y_min - y_pad, y_max + y_pad)
-        z_range = (z_min - z_pad, z_max + z_pad)
+        # 添加填充（按半径比例）
+        x_half = x_abs * (1.0 + padding)
+        y_half = y_abs * (1.0 + padding)
+
+        # Z：也按 0 对称（覆盖下半部分），更适合“以 base 为中心”的可达空间展示
+        z_abs = float(max(abs(z_min), abs(z_max)))
+        z_half = z_abs * (1.0 + padding)
+
+        # 给一个最小范围，避免采样不足导致范围过小
+        min_xy_half = 0.5  # meters
+        min_z_half = 0.5   # meters
+        x_half = max(x_half, min_xy_half)
+        y_half = max(y_half, min_xy_half)
+        z_half = max(z_half, min_z_half)
+
+        x_range = (-x_half, x_half)
+        y_range = (-y_half, y_half)
+        z_range = (-z_half, z_half)
 
         print(f"[IK求解器] 估计边界:")
         print(f"  X: [{x_range[0]:.3f}, {x_range[1]:.3f}]")

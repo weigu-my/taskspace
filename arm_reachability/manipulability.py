@@ -6,7 +6,6 @@ how well the robot can move in different directions at a given configuration.
 """
 
 import numpy as np
-import torch
 from typing import Optional, Tuple, List
 from dataclasses import dataclass
 
@@ -57,9 +56,10 @@ class ManipulabilityCalculator:
         self.use_pinocchio = False
         self.model = None
         self.data = None
+        self.active_joint_indices = None  # Indices in pinocchio q vector
 
         try:
-            import pinocchio as pin
+            import pinocchio as pin  # type: ignore
 
             # Load URDF with pinocchio
             self.model = pin.buildModelFromUrdf(self.robot_config.urdf_path)
@@ -76,6 +76,22 @@ class ManipulabilityCalculator:
                 # Try to use last frame
                 self.ee_frame_id = len(self.model.frames) - 1
                 print(f"[Manipulability] Warning: EE link not found, using frame {self.model.frames[self.ee_frame_id].name}")
+
+            # Build mapping from active joints to pinocchio q indices
+            self.active_joint_indices = []
+            active_joint_names = {j.name for j in self.robot_config.active_joints}
+            
+            for i in range(1, self.model.njoints):  # Skip universe (joint 0)
+                joint_name = self.model.names[i]
+                if joint_name in active_joint_names:
+                    joint = self.model.joints[i]
+                    # Add all q indices for this joint (handles multi-DOF joints)
+                    for q_idx in range(joint.idx_q, joint.idx_q + joint.nq):
+                        self.active_joint_indices.append(q_idx)
+
+            if len(self.active_joint_indices) != self.n_joints:
+                print(f"[Manipulability] Warning: Active joint count mismatch. "
+                      f"Expected {self.n_joints}, found {len(self.active_joint_indices)} in pinocchio model")
 
             self.use_pinocchio = True
             print(f"[Manipulability] Using Pinocchio for analytical Jacobian")
@@ -101,21 +117,33 @@ class ManipulabilityCalculator:
 
     def _compute_jacobian_pinocchio(self, joint_positions: np.ndarray) -> np.ndarray:
         """Compute Jacobian using Pinocchio."""
-        import pinocchio as pin
+        import pinocchio as pin  # type: ignore
 
         q = np.array(joint_positions, dtype=np.float64)
 
-        # Pad q if model has more joints (e.g., fixed joints)
-        if len(q) < self.model.nq:
-            q_full = np.zeros(self.model.nq)
-            # Map active joints to full configuration
-            active_idx = 0
-            for i, name in enumerate(self.model.names[1:]):  # Skip universe
-                for j, joint in enumerate(self.robot_config.active_joints):
-                    if joint.name == name:
-                        q_full[i] = q[active_idx]
-                        active_idx += 1
-                        break
+        # Build full configuration vector for pinocchio model
+        if len(q) != self.model.nq:
+            q_full = np.zeros(self.model.nq, dtype=np.float64)
+            
+            # Map active joints to pinocchio q indices
+            if self.active_joint_indices is not None:
+                for i, q_idx in enumerate(self.active_joint_indices):
+                    if i < len(q) and q_idx < len(q_full):
+                        q_full[q_idx] = q[i]
+            else:
+                # Fallback: try to map by joint names using pinocchio's joint.idx_q
+                active_joint_map = {j.name: idx for idx, j in enumerate(self.robot_config.active_joints)}
+                for i in range(1, self.model.njoints):
+                    joint_name = self.model.names[i]
+                    if joint_name in active_joint_map:
+                        joint = self.model.joints[i]
+                        active_idx = active_joint_map[joint_name]
+                        if active_idx < len(q):
+                            # Handle multi-DOF joints using pinocchio's idx_q
+                            for j in range(joint.nq):
+                                pin_q_idx = joint.idx_q + j
+                                if pin_q_idx < len(q_full) and active_idx + j < len(q):
+                                    q_full[pin_q_idx] = q[active_idx + j]
             q = q_full
 
         # Compute forward kinematics and Jacobian
@@ -129,8 +157,11 @@ class ManipulabilityCalculator:
         )
 
         # Extract columns for active joints only
-        # For now, assume first n_joints columns
-        J = J_full[:, :self.n_joints]
+        if self.active_joint_indices is not None:
+            J = J_full[:, self.active_joint_indices]
+        else:
+            # Fallback: use first n_joints columns (may be incorrect)
+            J = J_full[:, :self.n_joints]
 
         return J.astype(np.float32)
 
@@ -142,24 +173,32 @@ class ManipulabilityCalculator:
         """
         Compute Jacobian numerically using finite differences.
 
+        Note: This is a placeholder implementation that returns a constant Jacobian.
+        For accurate results, install pinocchio or provide an FK function.
+
         Args:
             joint_positions: Joint configuration [n_joints]
-            epsilon: Finite difference step
+            epsilon: Finite difference step (not used in placeholder)
 
         Returns:
             Jacobian matrix [6, n_joints]
         """
-        # This is a simplified numerical approximation
-        # In practice, you should use a proper kinematics library
+        # Placeholder implementation: returns a constant Jacobian
+        # This will give incorrect manipulability values but prevents errors
+        # For accurate computation, install pinocchio or use GPUManipulabilityCalculator
+        # with an IK solver that provides FK
+        
         jacobian = np.zeros((6, self.n_joints), dtype=np.float32)
-
-        # For numerical stability, use a small perturbation
+        
+        # Use a simple approximation based on joint limits
+        # This is not accurate but provides a baseline
         for i in range(self.n_joints):
-            # We don't have FK here, so return identity-like Jacobian
-            # This is a placeholder - real implementation needs FK
-            jacobian[:3, i] = 0.1  # Linear part
-            jacobian[3:6, i] = 0.1  # Angular part
-
+            joint = self.robot_config.active_joints[i]
+            # Estimate linear velocity contribution (rough approximation)
+            # Assuming each joint contributes roughly equally to end-effector motion
+            jacobian[:3, i] = 0.1  # Linear part (placeholder)
+            jacobian[3:6, i] = 0.1  # Angular part (placeholder)
+        
         return jacobian
 
     def compute_manipulability(
@@ -353,15 +392,18 @@ class GPUManipulabilityCalculator:
             ik_solver: IK solver instance with FK capabilities
             device: Torch device
         """
+        import torch  # Import here since only this class needs it
+        
         self.ik_solver = ik_solver
         self.device = device
         self.n_joints = ik_solver.n_joints
+        self.torch = torch
 
     def compute_batch_gpu(
         self,
-        joint_positions: torch.Tensor,
+        joint_positions,  # torch.Tensor
         epsilon: float = 1e-5
-    ) -> torch.Tensor:
+    ) -> np.ndarray:
         """
         Compute manipulability for a batch using GPU numerical differentiation.
 
@@ -372,6 +414,7 @@ class GPUManipulabilityCalculator:
         Returns:
             Manipulability values [batch_size]
         """
+        torch = self.torch
         batch_size = joint_positions.shape[0]
 
         # Compute base FK
