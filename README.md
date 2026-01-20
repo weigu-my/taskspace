@@ -299,6 +299,81 @@ A: 可操作度计算依赖雅可比矩阵：
 2. 确保 URDF 中关节限位正确
 3. 检查末端执行器链接是否正确设置
 
+## Docker 部署
+
+本项目提供完整的 Docker 支持，便于快速部署和环境迁移。
+
+### GPU 版本（推荐）
+
+需要 NVIDIA GPU 和 nvidia-docker2：
+
+```bash
+# 构建镜像
+docker-compose build
+
+# 启动服务
+docker-compose up -d
+
+# 访问 Jupyter Lab
+# 打开浏览器访问 http://localhost:8888
+
+# 查看日志
+docker-compose logs -f
+
+# 停止服务
+docker-compose down
+```
+
+### CPU 版本
+
+适用于没有 GPU 的环境（注意：无 cuRobo 加速，使用模拟 IK）：
+
+```bash
+# 构建 CPU 版本镜像
+docker build -f Dockerfile.cpu -t arm-reachability-cpu .
+
+# 运行容器
+docker run -it --rm \
+    -p 8888:8888 \
+    -p 7000:7000 \
+    -v $(pwd):/workspace \
+    arm-reachability-cpu
+```
+
+### 直接运行分析
+
+```bash
+# GPU 版本
+docker-compose run --rm reachability python main.py --urdf /workspace/urdf/robot.urdf
+
+# CPU 版本
+docker run -it --rm \
+    -v $(pwd):/workspace \
+    arm-reachability-cpu \
+    python main.py --urdf /workspace/urdf/robot.urdf
+```
+
+### 挂载外部 URDF
+
+将 URDF 文件放在 `./urdf/` 目录下，容器会自动挂载：
+
+```bash
+mkdir -p urdf
+cp /path/to/your/robot.urdf urdf/
+docker-compose up -d
+```
+
+### Docker 镜像内容
+
+| 组件 | GPU 版本 | CPU 版本 |
+|------|---------|---------|
+| CUDA | 11.8 | - |
+| Python | 3.10 | 3.10 |
+| PyTorch | 2.1.0+cu118 | CPU 版本 |
+| cuRobo | 支持 | 不支持 |
+| Pinocchio | 支持 | 支持 |
+| Jupyter Lab | 支持 | 支持 |
+
 ## 许可证
 
 MIT License

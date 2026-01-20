@@ -1,0 +1,125 @@
+# =============================================================================
+# 机械臂可达性分析框架 Docker 镜像（CPU 版本）
+#
+# 适用于没有 NVIDIA GPU 的环境
+# 注意：CPU 版本不支持 cuRobo GPU 加速，IK 求解会使用模拟求解器
+# =============================================================================
+
+# 使用官方 Miniconda3 镜像
+FROM continuumio/miniconda3:latest
+
+# 设置环境变量
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV PYTHONUNBUFFERED=1
+
+# =============================================================================
+# 1. 安装系统依赖
+# =============================================================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # 基础工具
+    build-essential \
+    cmake \
+    git \
+    curl \
+    wget \
+    vim \
+    # OpenGL 和图形库
+    libgl1-mesa-dev \
+    libgl1-mesa-glx \
+    libglew-dev \
+    libosmesa6-dev \
+    libglfw3 \
+    libglfw3-dev \
+    # X11（可选）
+    xvfb \
+    x11-utils \
+    # 其他库
+    libeigen3-dev \
+    libboost-all-dev \
+    # 清理缓存
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# =============================================================================
+# 2. 配置 Conda 并安装 Pinocchio
+# =============================================================================
+RUN conda config --add channels conda-forge \
+    && conda config --set channel_priority strict \
+    && conda install -y python=3.10 \
+    # 科学计算
+    numpy \
+    scipy \
+    pandas \
+    # 机器人库
+    pinocchio \
+    hpp-fcl \
+    # 可视化
+    matplotlib \
+    # Jupyter
+    jupyterlab \
+    ipywidgets \
+    # 物理引擎
+    mujoco \
+    # 几何处理
+    trimesh \
+    networkx \
+    # 网页可视化
+    meshcat \
+    && conda clean -afy
+
+# =============================================================================
+# 3. 安装 PyTorch（CPU 版本）
+# =============================================================================
+RUN pip install --no-cache-dir \
+    torch \
+    torchvision \
+    --index-url https://download.pytorch.org/whl/cpu
+
+# =============================================================================
+# 4. 安装其他 Python 依赖
+# =============================================================================
+RUN pip install --no-cache-dir \
+    # URDF 解析
+    urdf-parser-py \
+    yourdfpy \
+    # 可视化
+    plotly \
+    # 配置文件
+    pyyaml \
+    # 图像处理
+    imageio \
+    imageio-ffmpeg \
+    Pillow
+
+# =============================================================================
+# 5. 设置工作目录和项目
+# =============================================================================
+WORKDIR /workspace
+
+# 复制项目文件
+COPY . /workspace/
+
+# =============================================================================
+# 6. 环境变量配置
+# =============================================================================
+# OpenGL 渲染（无头模式）
+ENV MUJOCO_GL=osmesa
+ENV PYOPENGL_PLATFORM=osmesa
+
+# Jupyter 配置
+ENV JUPYTER_ALLOW_INSECURE_WRITES=true
+
+# Python 路径
+ENV PYTHONPATH=/workspace:${PYTHONPATH}
+
+# =============================================================================
+# 7. 暴露端口
+# =============================================================================
+EXPOSE 8888 7000
+
+# =============================================================================
+# 8. 入口点
+# =============================================================================
+CMD ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root", "--NotebookApp.token=''"]
