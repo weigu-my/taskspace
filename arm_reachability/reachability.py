@@ -326,20 +326,33 @@ class ReachabilityAnalyzer:
             最优关节配置 [n_positions, n_joints]
         """
         n_positions = len(positions)
-        # 使用IK求解器的关节数，而不是URDF中的总关节数
-        # cuRobo只使用从基座到末端的运动链中的关节
-        n_joints = self.ik_solver.n_joints
-        best_solutions = np.zeros((n_positions, n_joints), dtype=np.float32)
 
         # 获取可达位置的索引
         reachable_indices = np.where(reachable_mask)[0]
         n_reachable = len(reachable_indices)
 
-        if n_reachable == 0:
-            return best_solutions
-
         # 使用第一个姿态
         default_orientation = orientations[0]
+
+        # 先用一个小批次探测实际的关节数
+        # cuRobo内部可能只使用运动链中的部分关节
+        if n_reachable > 0:
+            test_positions = positions[reachable_indices[:1]]
+            test_orientations = np.tile(default_orientation, (1, 1))
+            test_result = self.ik_solver.solve_batch(
+                positions=test_positions,
+                orientations=test_orientations,
+                return_all_solutions=False
+            )
+            n_joints = test_result.best_solutions.shape[1]
+            print(f"  IK求解器实际关节数: {n_joints}")
+        else:
+            n_joints = self.ik_solver.n_joints
+
+        best_solutions = np.zeros((n_positions, n_joints), dtype=np.float32)
+
+        if n_reachable == 0:
+            return best_solutions
 
         # 分批处理可达位置
         print(f"  可达点数: {n_reachable}")
