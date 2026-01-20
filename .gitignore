@@ -8,6 +8,10 @@ __pycache__/
 *.csv
 *.json
 *.html
+*.urdf
+*.stl
+*.xml
+
 
 # 忽略输出文件夹 (如果有)
 reachability_output/
