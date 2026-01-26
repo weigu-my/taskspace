@@ -663,6 +663,37 @@ class ReachabilityVisualizer:
 
         return fig, ax
 
+    def visualize_rviz(
+        self,
+        frame_id: str = "world",
+        topic: str = "/reachability/points",
+        keep_alive: bool = True
+    ):
+        """
+        在 RViz2 中可视化可达性结果
+
+        参数:
+            frame_id: 坐标系名称
+            topic: 点云 Topic 名称
+            keep_alive: 是否保持节点运行（持续发布）
+
+        注意: 需要 ROS 2 环境
+        """
+        from .ros2_visualization import RVizReachabilityPublisher, RVizPublisherConfig
+
+        config = RVizPublisherConfig(
+            pointcloud_topic=topic,
+            frame_id=frame_id,
+            publish_rate=1.0 if keep_alive else 0
+        )
+
+        publisher = RVizReachabilityPublisher(config)
+
+        if keep_alive:
+            publisher.spin(self.result)
+        else:
+            publisher.publish(self.result)
+
     def _draw_robot_skeleton(self, ax):
         """绘制机器人骨架（关节原点之间的连线）"""
         try:
