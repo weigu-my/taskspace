@@ -68,7 +68,14 @@ class MultiSeedIKSolver:
         self.tensor_args = None
         self._current_batch_size = None  # 跟踪当前批次大小
 
+        # 用于坐标变换的 Pinocchio 模型
+        self.pin_model = None
+        self.pin_data = None
+        self.base_link_frame_id = None
+        self._base_transform = None  # 世界坐标系到 base_link 的变换
+
         self._initialize_solver()
+        self._initialize_transforms()
 
     def _initialize_solver(self):
         """初始化cuRobo IK求解器"""
@@ -163,6 +170,129 @@ class MultiSeedIKSolver:
         self.n_joints = len(self.robot_config.active_joints)
         print("[模拟求解器] 已初始化用于测试")
 
+    def _initialize_transforms(self):
+        """初始化坐标变换，用于将世界坐标转换为 base_link 坐标"""
+        try:
+            import pinocchio as pin
+
+            # 加载 URDF 模型
+            self.pin_model = pin.buildModelFromUrdf(self.robot_config.urdf_path)
+            self.pin_data = self.pin_model.createData()
+
+            # 查找 base_link 帧 ID
+            self.base_link_frame_id = None
+            for i, frame in enumerate(self.pin_model.frames):
+                if frame.name == self.robot_config.base_link:
+                    self.base_link_frame_id = i
+                    break
+
+            if self.base_link_frame_id is None:
+                raise RuntimeError(f"未找到 base_link '{self.robot_config.base_link}' 的帧")
+
+            # 计算零位姿下 base_link 在世界坐标系中的位置
+            q_neutral = np.zeros(self.pin_model.nq)
+            for i in range(self.pin_model.njoints):
+                joint = self.pin_model.joints[i]
+                if joint.nq > 0:
+                    idx_q = joint.idx_q
+                    q_neutral[idx_q:idx_q+joint.nq] = 0.0
+
+            # 前向运动学
+            pin.forwardKinematics(self.pin_model, self.pin_data, q_neutral)
+            pin.updateFramePlacements(self.pin_model, self.pin_data)
+
+            # 获取 base_link 在世界坐标系中的变换
+            base_transform = self.pin_data.oMf[self.base_link_frame_id]
+
+            # 存储 base_link 的位置和旋转
+            self._base_transform = {
+                'translation': base_transform.translation.copy(),  # [3]
+                'rotation': base_transform.rotation.copy()         # [3, 3]
+            }
+
+            print(f"[IK求解器] base_link '{self.robot_config.base_link}' 在世界坐标系中的位置:")
+            print(f"  位置: {self._base_transform['translation']}")
+            print(f"[IK求解器] 将 FK 结果转换为相对于 base_link 的坐标")
+            return
+
+        except Exception as e:
+            print(f"[IK求解器] Pinocchio 变换初始化失败: {e}")
+
+        # 回退方案：使用 URDF 关节树估算 base_link 在世界坐标系中的变换
+        fallback = self._compute_base_transform_from_urdf()
+        if fallback is not None:
+            self._base_transform = fallback
+            print(f"[IK求解器] 使用URDF树估算 base_link '{self.robot_config.base_link}' 在世界坐标系中的位置:")
+            print(f"  位置: {self._base_transform['translation']}")
+            print(f"[IK求解器] 将 FK 结果转换为相对于 base_link 的坐标")
+        else:
+            print(f"[IK求解器] 将使用世界坐标系（不进行坐标变换）")
+
+    def _rpy_to_matrix(self, roll: float, pitch: float, yaw: float) -> np.ndarray:
+        cr, sr = np.cos(roll), np.sin(roll)
+        cp, sp = np.cos(pitch), np.sin(pitch)
+        cy, sy = np.cos(yaw), np.sin(yaw)
+        return np.array([
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr],
+        ], dtype=np.float64)
+
+    def _compute_base_transform_from_urdf(self) -> Optional[dict]:
+        """在未安装 Pinocchio 时，使用 URDF 关节树估算 base_link 变换"""
+        try:
+            link_names = {l.name for l in self.robot_config.links}
+            child_links = {j.child_link for j in self.robot_config.joints}
+            roots = list(link_names - child_links)
+            if not roots:
+                roots = [self.robot_config.base_link]
+
+            world_like = {"world", "map", "odom"}
+            roots.sort(key=lambda x: (0 if x.lower() in world_like else 1, x))
+
+            by_parent = {}
+            for j in self.robot_config.joints:
+                by_parent.setdefault(j.parent_link, []).append(j)
+
+            T = {r: np.eye(4, dtype=np.float64) for r in roots}
+            queue = list(roots)
+            visited = set(roots)
+
+            while queue:
+                parent = queue.pop(0)
+                for j in by_parent.get(parent, []):
+                    child = j.child_link
+                    if child in visited:
+                        continue
+
+                    T_origin = np.eye(4, dtype=np.float64)
+                    T_origin[:3, 3] = np.array(j.origin_xyz, dtype=np.float64)
+                    T_origin[:3, :3] = self._rpy_to_matrix(
+                        j.origin_rpy[0], j.origin_rpy[1], j.origin_rpy[2]
+                    )
+
+                    # 在零位姿下，关节运动为单位变换
+                    T_child = T[parent] @ T_origin
+                    T[child] = T_child
+                    visited.add(child)
+                    queue.append(child)
+
+            if self.robot_config.base_link not in T:
+                return None
+
+            base_T = T[self.robot_config.base_link]
+            return {
+                'translation': base_T[:3, 3].copy(),
+                'rotation': base_T[:3, :3].copy()
+            }
+        except Exception as e:
+            print(f"[IK求解器] 无法使用URDF计算 base_link 变换: {e}")
+            return None
+
+    def get_base_transform(self) -> Optional[dict]:
+        """获取 base_link 在世界坐标系中的变换（translation, rotation）"""
+        return self._base_transform
+
     def solve_single(
         self,
         position: np.ndarray,
@@ -172,7 +302,7 @@ class MultiSeedIKSolver:
         为单个目标位姿求解IK（使用多种子）
 
         参数:
-            position: 目标位置 [3]
+            position: 目标位置 [3]（相对于 base_link）
             orientation: 目标姿态四元数 [4] (w, x, y, z)
 
         返回:
@@ -183,10 +313,13 @@ class MultiSeedIKSolver:
 
         from curobo.types.math import Pose
 
+        # 将目标位置从 base_link 坐标系转换到世界坐标系（cuRobo 需要）
+        world_position = self._transform_to_world_frame(position)
+
         # 创建目标位姿
         goal_pose = Pose(
             position=torch.tensor(
-                position.reshape(1, 3),
+                world_position.reshape(1, 3),
                 dtype=torch.float32,
                 device=self.device
             ),
@@ -267,7 +400,8 @@ class MultiSeedIKSolver:
         self,
         positions: np.ndarray,
         orientations: np.ndarray,
-        return_all_solutions: bool = True
+        return_all_solutions: bool = True,
+        positions_in_world: bool = False
     ) -> BatchIKResult:
         """
         使用GPU加速批量求解IK
@@ -276,6 +410,7 @@ class MultiSeedIKSolver:
             positions: 目标位置 [batch_size, 3]
             orientations: 目标姿态四元数 [batch_size, 4] (w, x, y, z)
             return_all_solutions: 如果为True，返回所有种子的解
+            positions_in_world: 如果为True，positions已经是world坐标系，不需要转换
 
         返回:
             包含所有位姿解的BatchIKResult
@@ -288,10 +423,16 @@ class MultiSeedIKSolver:
 
         from curobo.types.math import Pose
 
+        # 如果位置已经是 world 坐标系，直接使用；否则从 base_link 转换
+        if positions_in_world:
+            world_positions = positions
+        else:
+            world_positions = self._transform_to_world_frame(positions)
+
         # 创建目标位姿
         goal_pose = Pose(
             position=torch.tensor(
-                positions,
+                world_positions,
                 dtype=torch.float32,
                 device=self.device
             ),
@@ -399,7 +540,8 @@ class MultiSeedIKSolver:
         self,
         positions: np.ndarray,
         orientations: np.ndarray,
-        batch_size: int = 1024
+        batch_size: int = 1024,
+        positions_in_world: bool = False
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         为多个位置和多个姿态求解IK
@@ -410,6 +552,7 @@ class MultiSeedIKSolver:
             positions: 网格位置 [n_positions, 3]
             orientations: 要测试的姿态 [n_orientations, 4]
             batch_size: GPU批处理大小
+            positions_in_world: 如果为 True，positions 已经是 world 坐标系
 
         返回:
             元组包含:
@@ -449,7 +592,8 @@ class MultiSeedIKSolver:
             result = self.solve_batch(
                 batch_positions,
                 batch_orientations,
-                return_all_solutions=False
+                return_all_solutions=False,
+                positions_in_world=positions_in_world
             )
 
             all_success.append(result.success_mask)
@@ -478,6 +622,72 @@ class MultiSeedIKSolver:
 
         return reachable_mask, dexterity, num_solutions_grid
 
+    def _transform_to_base_frame(self, world_positions: np.ndarray) -> np.ndarray:
+        """
+        将世界坐标系中的位置转换为 base_link 坐标系
+
+        参数:
+            world_positions: 世界坐标系中的位置 [batch_size, 3] 或 [3]
+
+        返回:
+            base_positions: base_link 坐标系中的位置 [batch_size, 3] 或 [3]
+        """
+        if self._base_transform is None:
+            # 没有变换信息，直接返回原始位置
+            return world_positions
+
+        # 提取 base_link 的位置和旋转
+        base_translation = self._base_transform['translation']
+        base_rotation = self._base_transform['rotation']
+
+        # 将位置从世界坐标系转换到 base_link 坐标系
+        # p_base = R^T * (p_world - t_base)
+        if world_positions.ndim == 1:
+            # 单个位置 [3]
+            relative_pos = world_positions - base_translation
+            base_positions = base_rotation.T @ relative_pos
+        else:
+            # 批量位置 [batch_size, 3]
+            relative_pos = world_positions - base_translation[np.newaxis, :]
+            # 使用 einsum 保持数组连续性
+            base_positions = np.einsum('ji,nj->ni', base_rotation, relative_pos)
+            # 确保数组在内存中是连续的
+            base_positions = np.ascontiguousarray(base_positions)
+
+        return base_positions
+
+    def _transform_to_world_frame(self, base_positions: np.ndarray) -> np.ndarray:
+        """
+        将 base_link 坐标系中的位置转换为世界坐标系
+
+        参数:
+            base_positions: base_link 坐标系中的位置 [batch_size, 3] 或 [3]
+
+        返回:
+            world_positions: 世界坐标系中的位置 [batch_size, 3] 或 [3]
+        """
+        if self._base_transform is None:
+            # 没有变换信息，直接返回原始位置
+            return base_positions
+
+        # 提取 base_link 的位置和旋转
+        base_translation = self._base_transform['translation']
+        base_rotation = self._base_transform['rotation']
+
+        # 将位置从 base_link 坐标系转换到世界坐标系
+        # p_world = R * p_base + t_base
+        if base_positions.ndim == 1:
+            # 单个位置 [3]
+            world_positions = base_rotation @ base_positions + base_translation
+        else:
+            # 批量位置 [batch_size, 3]
+            # 使用 einsum 保持数组连续性，避免 cuRobo 的张量视图问题
+            world_positions = np.einsum('ij,nj->ni', base_rotation, base_positions) + base_translation[np.newaxis, :]
+            # 确保数组在内存中是连续的
+            world_positions = np.ascontiguousarray(world_positions)
+
+        return world_positions
+
     def get_forward_kinematics(self, joint_positions: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         计算给定关节位置的正运动学
@@ -487,7 +697,7 @@ class MultiSeedIKSolver:
 
         返回:
             元组包含:
-                - positions: 末端执行器位置 [batch_size, 3]
+                - positions: 末端执行器位置（相对于 base_link）[batch_size, 3]
                 - orientations: 末端执行器姿态 [batch_size, 4]
         """
         if self.ik_solver is None:
@@ -507,8 +717,11 @@ class MultiSeedIKSolver:
 
         state = self.ik_solver.fk(q)
 
-        positions = state.ee_position.cpu().numpy()
+        world_positions = state.ee_position.cpu().numpy()
         orientations = state.ee_quaternion.cpu().numpy()  # (w, x, y, z)
+
+        # 转换到 base_link 坐标系
+        positions = self._transform_to_base_frame(world_positions)
 
         return positions, orientations
 
@@ -521,7 +734,7 @@ class MultiSeedIKSolver:
 
         返回:
             元组包含:
-                - positions: 采样的末端执行器位置 [n_samples, 3]
+                - positions: 采样的末端执行器位置（相对于 base_link）[n_samples, 3]
                 - joint_configs: 对应的关节配置 [n_samples, n_joints]
         """
         # 在限位范围内生成随机关节配置
@@ -543,19 +756,27 @@ class MultiSeedIKSolver:
     def estimate_workspace_bounds(
         self,
         n_samples: int = 10000,
-        padding: float = 0.1
+        padding: float = 0.5
     ) -> Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]:
         """
-        使用FK采样估计工作空间边界
+        使用FK采样估计工作空间边界（相对于 base_link）
+
+        该方法通过随机采样关节配置并计算 FK，估计机械臂的工作空间边界。
+        返回的边界是相对于 base_link 坐标系的，即 base_link 位于原点 (0, 0, 0)。
+
+        重要：为了显示完整的可达空间边界（球形/环形），我们需要将采样范围
+        扩展到 FK 可达范围之外。默认 padding=0.5 (50%) 可以较好地显示边界。
 
         参数:
             n_samples: 用于估计的样本数量
-            padding: 添加到边界的填充比例
+            padding: 添加到边界的填充比例（默认 0.5 = 50%，确保能看到可达边界）
 
         返回:
             (x_range, y_range, z_range) 元组，每个为 (min, max) 元组
+            边界相对于 base_link 坐标系
         """
         print(f"[IK求解器] 使用 {n_samples} 个FK样本估计工作空间边界...")
+        print(f"[IK求解器] 边界将相对于 base_link '{self.robot_config.base_link}' 计算")
 
         positions, _ = self.sample_workspace(n_samples)
 
@@ -564,32 +785,114 @@ class MultiSeedIKSolver:
 
         # ============================
         # 边界策略说明
-        # - x/y：以 base_link 为中心(0,0)对称更直观，也避免出现“原点在 base 但范围偏一边”
-        # - z：通常机械臂主要在 base 上方工作，保留非对称边界，但至少覆盖 z=0
+        # FK 采样得到的是实际可达位置，为了显示完整的可达空间边界（类球形），
+        # 需要将采样范围扩展到可达范围之外。
+        #
+        # - x/y：以 base_link 为中心对称
+        # - z：同样对称，覆盖上下空间
+        # - padding=0.5：扩展 50%，确保能看到可达边界
         # ============================
         x_abs = float(max(abs(x_min), abs(x_max)))
         y_abs = float(max(abs(y_min), abs(y_max)))
+        z_abs = float(max(abs(z_min), abs(z_max)))
 
-        # 添加填充（按半径比例）
+        # 添加填充（扩展范围以显示可达边界）
         x_half = x_abs * (1.0 + padding)
         y_half = y_abs * (1.0 + padding)
-
-        # Z：也按 0 对称（覆盖下半部分），更适合“以 base 为中心”的可达空间展示
-        z_abs = float(max(abs(z_min), abs(z_max)))
         z_half = z_abs * (1.0 + padding)
 
         # 给一个最小范围，避免采样不足导致范围过小
-        min_xy_half = 0.5  # meters
-        min_z_half = 0.5   # meters
-        x_half = max(x_half, min_xy_half)
-        y_half = max(y_half, min_xy_half)
-        z_half = max(z_half, min_z_half)
+        min_half = 0.5  # meters
+        x_half = max(x_half, min_half)
+        y_half = max(y_half, min_half)
+        z_half = max(z_half, min_half)
 
         x_range = (-x_half, x_half)
         y_range = (-y_half, y_half)
         z_range = (-z_half, z_half)
 
-        print(f"[IK求解器] 估计边界:")
+        print(f"[IK求解器] FK 可达范围:")
+        print(f"  X: [{x_min:.3f}, {x_max:.3f}]")
+        print(f"  Y: [{y_min:.3f}, {y_max:.3f}]")
+        print(f"  Z: [{z_min:.3f}, {z_max:.3f}]")
+        print(f"[IK求解器] 扩展后采样边界 (padding={padding*100:.0f}%):")
+        print(f"  X: [{x_range[0]:.3f}, {x_range[1]:.3f}]")
+        print(f"  Y: [{y_range[0]:.3f}, {y_range[1]:.3f}]")
+        print(f"  Z: [{z_range[0]:.3f}, {z_range[1]:.3f}]")
+
+        return x_range, y_range, z_range
+
+    def estimate_workspace_bounds_world(
+        self,
+        n_samples: int = 10000,
+        padding: float = 0.5
+    ) -> Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]:
+        """
+        在 world 坐标系下估计工作空间边界
+
+        与 estimate_workspace_bounds 不同，此方法直接在 world 坐标系下计算边界，
+        考虑了 base_link 相对于 world 的旋转。这对于双臂机器人特别重要，
+        因为每条臂的 base_link 可能有不同的旋转角度。
+
+        参数:
+            n_samples: 用于估计的样本数量
+            padding: 添加到边界的填充比例（默认 0.5 = 50%）
+
+        返回:
+            (x_range, y_range, z_range) 元组，每个为 (min, max) 元组
+            边界在 world 坐标系下
+        """
+        print(f"[IK求解器] 使用 {n_samples} 个FK样本估计工作空间边界（world 坐标系）...")
+        print(f"[IK求解器] base_link: '{self.robot_config.base_link}'")
+
+        if self.ik_solver is None:
+            print("[IK求解器] 求解器未初始化，回退到 base_link 坐标系")
+            return self.estimate_workspace_bounds(n_samples, padding)
+
+        # 在关节限位范围内生成随机关节配置
+        active_joints = self.robot_config.active_joints
+        joint_configs = np.zeros((n_samples, self.n_joints), dtype=np.float32)
+
+        for i, joint in enumerate(active_joints):
+            joint_configs[:, i] = np.random.uniform(
+                joint.lower_limit,
+                joint.upper_limit,
+                n_samples
+            )
+
+        # 计算 FK，直接获取 world 坐标系的位置（不转换到 base_link）
+        q = torch.tensor(joint_configs, dtype=torch.float32, device=self.device)
+        state = self.ik_solver.fk(q)
+        world_positions = state.ee_position.cpu().numpy()  # world 坐标系
+
+        # 计算 world 坐标系下的边界
+        x_min, y_min, z_min = world_positions.min(axis=0)
+        x_max, y_max, z_max = world_positions.max(axis=0)
+
+        # 计算范围并添加 padding
+        x_range_val = x_max - x_min
+        y_range_val = y_max - y_min
+        z_range_val = z_max - z_min
+
+        x_pad = x_range_val * padding / 2
+        y_pad = y_range_val * padding / 2
+        z_pad = z_range_val * padding / 2
+
+        # 最小 padding
+        min_pad = 0.25  # meters
+        x_pad = max(x_pad, min_pad)
+        y_pad = max(y_pad, min_pad)
+        z_pad = max(z_pad, min_pad)
+
+        x_range = (float(x_min - x_pad), float(x_max + x_pad))
+        y_range = (float(y_min - y_pad), float(y_max + y_pad))
+        z_range = (float(z_min - z_pad), float(z_max + z_pad))
+
+        print(f"[IK求解器] FK 可达范围 (world 坐标系):")
+        print(f"  X: [{x_min:.3f}, {x_max:.3f}]")
+        print(f"  Y: [{y_min:.3f}, {y_max:.3f}]")
+        print(f"  Z: [{z_min:.3f}, {z_max:.3f}]")
+        print(f"[IK求解器] 扩展后采样边界 (padding={padding*100:.0f}%):")
         print(f"  X: [{x_range[0]:.3f}, {x_range[1]:.3f}]")
         print(f"  Y: [{y_range[0]:.3f}, {y_range[1]:.3f}]")
         print(f"  Z: [{z_range[0]:.3f}, {z_range[1]:.3f}]")

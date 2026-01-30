@@ -14,6 +14,11 @@ from typing import Optional, List, Tuple, Dict, Any
 from dataclasses import dataclass
 import xml.etree.ElementTree as ET
 
+# 强制使用无界面后端，避免 Qt/xcb 依赖导致崩溃
+os.environ.setdefault("MPLBACKEND", "Agg")
+import matplotlib
+matplotlib.use("Agg")
+
 from .urdf_parser import RobotConfig, URDFParser
 from .reachability import ReachabilityResult
 from .utils import colormap_dexterity, size_from_manipulability
@@ -570,7 +575,11 @@ class ReachabilityVisualizer:
             fig.write_html(save_html)
             print(f"已保存可视化到 {save_html}")
         else:
-            fig.show()
+            # 无显示环境时避免调用 fig.show() 触发 Qt/X11
+            if os.environ.get("DISPLAY") in (None, ""):
+                print("[提示] 无显示环境，跳过交互式窗口。使用 --no-visualization 或查看保存的 HTML。")
+            else:
+                fig.show()
 
         return fig
 
@@ -670,29 +679,64 @@ class ReachabilityVisualizer:
         keep_alive: bool = True
     ):
         """
-        在 RViz2 中可视化可达性结果
+        将当前可达性结果发布到 RViz2
 
         参数:
             frame_id: 坐标系名称
-            topic: 点云 Topic 名称
+            topic: 点云 Topic 名称（例如 /reachability/points）
             keep_alive: 是否保持节点运行（持续发布）
 
-        注意: 需要 ROS 2 环境
+        注意: 需要在已安装并 source 的 ROS 2 环境下运行。
         """
-        from .ros2_visualization import RVizReachabilityPublisher, RVizPublisherConfig
+        from .ros2_visualization import (
+            RVizReachabilityPublisher,
+            RVizPublisherConfig,
+            ArmConfig,
+        )
+
+        # 解析 topic，得到基础前缀和可选后缀
+        # 目标: base_topic + "/points" + topic_suffix == 输入的 topic
+        if "/" in topic:
+            base_topic, last = topic.rsplit("/", 1)
+            base_topic = base_topic or "/"
+            if last.startswith("points"):
+                topic_suffix = last[len("points"):]  # "" 或 "_left"
+            else:
+                # 非标准命名，退化为直接挂在 base_topic 下
+                topic_suffix = f"_{last}"
+        else:
+            base_topic = f"/{topic}" if not topic.startswith("/") else topic
+            topic_suffix = ""
+
+        arm = ArmConfig(
+            name="default",
+            urdf_path=self.robot_config.urdf_path,
+            data_dir=None,            # 直接使用内存中的结果
+            data_prefix="reachability",
+            topic_suffix=topic_suffix,
+        )
 
         config = RVizPublisherConfig(
-            pointcloud_topic=topic,
             frame_id=frame_id,
-            publish_rate=1.0 if keep_alive else 0
+            publish_rate=1.0 if keep_alive else 0.0,
+            base_topic=base_topic,
+            arms=[arm],
         )
 
         publisher = RVizReachabilityPublisher(config)
 
+        # 直接注入当前结果，避免落盘再加载
+        publisher._ensure_ros_init()
+        publisher._results[arm.name] = self.result
+
+        print(f"[RViz] 准备发布点云到 {base_topic}/points{topic_suffix}，frame_id={frame_id}，"
+              f"点数={self.result.reachable_count}，保持运行={keep_alive}")
+
         if keep_alive:
-            publisher.spin(self.result)
+            publisher.spin()
         else:
-            publisher.publish(self.result)
+            publisher.publish_all()
+            publisher.destroy()
 
     def _draw_robot_skeleton(self, ax):
         """绘制机器人骨架（关节原点之间的连线）"""

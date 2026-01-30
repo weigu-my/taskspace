@@ -13,6 +13,7 @@ from typing import Optional, List
 from dataclasses import dataclass, field
 import struct
 import os
+import math
 
 
 def _import_ros2():
@@ -54,6 +55,16 @@ class RVizPublisherConfig:
     # 基础 Topic 名称
     base_topic: str = "/reachability"
 
+    # 是否发布 TF（让 RViz 的 RobotModel 能正确摆放所有 link）
+    publish_tf: bool = True
+
+    # 是否使用结果中的 base_transform 将点云转换到 frame_id
+    # 当 TF 不完整或 base_link 在 world 中位置不正确时很有用
+    use_base_transform: bool = True
+
+    # 是否在 base_transform 中应用旋转（False 表示仅平移）
+    use_base_transform_rotation: bool = True
+
 
 class RVizReachabilityPublisher:
     """
@@ -73,6 +84,10 @@ class RVizReachabilityPublisher:
         self._robot_desc_publishers = {}  # {arm_name: publisher}
         self._joint_state_publishers = {}  # {arm_name: publisher}
         self._results = {}  # {arm_name: result}
+        self._robot_desc_published = False  # 跟踪是否已发布 robot_description（多臂模式）
+        self._tf_broadcaster = None
+        self._robot_configs = {}  # {arm_name: RobotConfig}
+        self._last_world_transforms = {}  # {arm_name: {link_name: 4x4}}
 
     def _ensure_ros_init(self):
         """确保 ROS 2 已初始化"""
@@ -99,16 +114,33 @@ class RVizReachabilityPublisher:
         # 创建节点
         self._node = rclpy.create_node('reachability_visualizer')
 
+        # TF broadcaster（可选）
+        try:
+            import tf2_ros
+            from geometry_msgs.msg import TransformStamped
+            self._tf2_ros = tf2_ros
+            self._TransformStamped = TransformStamped
+            self._tf_broadcaster = tf2_ros.TransformBroadcaster(self._node)
+        except Exception as e:
+            # 没有 TF 支持时 RobotModel 会缺姿态，但点云仍可用
+            self._node.get_logger().warn(f"TF 广播器不可用（RobotModel 可能无法显示完整姿态）: {e}")
+            self._tf_broadcaster = None
+
         # Transient Local QoS for robot_description (latched)
         self._latched_qos = QoSProfile(
             depth=1,
             durability=DurabilityPolicy.TRANSIENT_LOCAL
         )
 
+        # 多臂模式：只发布一个完整的 robot_description
+        is_multi_arm = len(self.config.arms) > 1
+        robot_desc_published = False
+
         # 为每个臂创建发布器
         for arm in self.config.arms:
             suffix = f"_{arm.name}" if arm.name else ""
-            topic_suffix = arm.topic_suffix or suffix
+            # 允许显式空字符串保持无后缀；仅在 None 时回退
+            topic_suffix = arm.topic_suffix if arm.topic_suffix is not None else suffix
 
             # 点云发布器
             topic = f"{self.config.base_topic}/points{topic_suffix}"
@@ -117,11 +149,24 @@ class RVizReachabilityPublisher:
             )
 
             # 机器人描述发布器 (如果有URDF)
+            # 多臂模式：只发布一次完整的 robot_description（不带后缀）
+            # 单臂模式：可以发布带后缀的 robot_description
             if arm.urdf_path and os.path.exists(arm.urdf_path):
-                desc_topic = f"/robot_description{topic_suffix}"
-                self._robot_desc_publishers[arm.name] = self._node.create_publisher(
-                    String, desc_topic, self._latched_qos
-                )
+                if is_multi_arm:
+                    # 多臂模式：只发布一次到标准 topic
+                    if not robot_desc_published:
+                        desc_topic = "/robot_description"
+                        self._robot_desc_publishers[arm.name] = self._node.create_publisher(
+                            String, desc_topic, self._latched_qos
+                        )
+                        robot_desc_published = True
+                        self._node.get_logger().info(f"多臂模式：发布完整机器人URDF到 {desc_topic}")
+                else:
+                    # 单臂模式：发布带后缀的 topic
+                    desc_topic = f"/robot_description{topic_suffix}"
+                    self._robot_desc_publishers[arm.name] = self._node.create_publisher(
+                        String, desc_topic, self._latched_qos
+                    )
 
                 # 关节状态发布器
                 js_topic = f"/joint_states{topic_suffix}"
@@ -133,6 +178,233 @@ class RVizReachabilityPublisher:
         self._node.get_logger().info(
             f'RViz 可达性发布器已初始化，臂数量: {len(self.config.arms)}'
         )
+
+    def _get_robot_config(self, arm: ArmConfig):
+        """解析并缓存 URDF（用于发布 TF）"""
+        if arm.name in self._robot_configs:
+            return self._robot_configs[arm.name]
+        if not arm.urdf_path or not os.path.exists(arm.urdf_path):
+            return None
+        try:
+            from .urdf_parser import URDFParser
+            robot_config = URDFParser(arm.urdf_path).parse()
+            self._robot_configs[arm.name] = robot_config
+            return robot_config
+        except Exception as e:
+            self._node.get_logger().warn(f"解析 URDF 失败（无法发布 TF）: {e}")
+            return None
+
+    def _rpy_to_matrix(self, roll: float, pitch: float, yaw: float) -> np.ndarray:
+        cr, sr = math.cos(roll), math.sin(roll)
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        return np.array([
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr],
+        ], dtype=np.float64)
+
+    def _axis_angle_to_matrix(self, axis: np.ndarray, angle: float) -> np.ndarray:
+        axis = axis.astype(np.float64)
+        n = np.linalg.norm(axis)
+        if n < 1e-12:
+            return np.eye(3)
+        axis = axis / n
+        x, y, z = axis
+        c = math.cos(angle)
+        s = math.sin(angle)
+        C = 1.0 - c
+        return np.array([
+            [c + x * x * C, x * y * C - z * s, x * z * C + y * s],
+            [y * x * C + z * s, c + y * y * C, y * z * C - x * s],
+            [z * x * C - y * s, z * y * C + x * s, c + z * z * C],
+        ], dtype=np.float64)
+
+    def _matrix_to_quaternion(self, R: np.ndarray) -> tuple:
+        # 返回 (x, y, z, w)
+        tr = float(R[0, 0] + R[1, 1] + R[2, 2])
+        if tr > 0.0:
+            S = math.sqrt(tr + 1.0) * 2.0
+            w = 0.25 * S
+            x = (R[2, 1] - R[1, 2]) / S
+            y = (R[0, 2] - R[2, 0]) / S
+            z = (R[1, 0] - R[0, 1]) / S
+        elif (R[0, 0] > R[1, 1]) and (R[0, 0] > R[2, 2]):
+            S = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+            w = (R[2, 1] - R[1, 2]) / S
+            x = 0.25 * S
+            y = (R[0, 1] + R[1, 0]) / S
+            z = (R[0, 2] + R[2, 0]) / S
+        elif R[1, 1] > R[2, 2]:
+            S = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+            w = (R[0, 2] - R[2, 0]) / S
+            x = (R[0, 1] + R[1, 0]) / S
+            y = 0.25 * S
+            z = (R[1, 2] + R[2, 1]) / S
+        else:
+            S = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+            w = (R[1, 0] - R[0, 1]) / S
+            x = (R[0, 2] + R[2, 0]) / S
+            y = (R[1, 2] + R[2, 1]) / S
+            z = 0.25 * S
+        return (x, y, z, w)
+
+    def _base_transform_to_matrix(self, base_transform: dict, use_rotation: bool = True) -> Optional[np.ndarray]:
+        """将 base_transform(dict) 转为 4x4 变换矩阵"""
+        if not base_transform:
+            return None
+        try:
+            t = np.array(base_transform.get('translation'), dtype=np.float64).reshape(3)
+            if use_rotation:
+                R = np.array(base_transform.get('rotation'), dtype=np.float64).reshape(3, 3)
+            else:
+                R = np.eye(3, dtype=np.float64)
+        except Exception:
+            return None
+        T = np.eye(4, dtype=np.float64)
+        T[:3, :3] = R
+        T[:3, 3] = t
+        return T
+
+    def _get_root_links(self, robot_config) -> List[str]:
+        """获取URDF的根链接列表（不作为任何关节的child）"""
+        link_names = {l.name for l in robot_config.links}
+        child_links = {j.child_link for j in robot_config.joints}
+        roots = list(link_names - child_links)
+        if not roots:
+            return [robot_config.base_link]
+        world_like = {"world", "map", "odom"}
+        roots.sort(key=lambda x: (0 if x.lower() in world_like else 1, x))
+        return roots
+
+    def _compute_world_link_transforms(self, robot_config, joint_pos: dict) -> dict:
+        """计算每个 link 相对 frame_id 的 4x4 变换（从URDF根链接开始）"""
+        roots = self._get_root_links(robot_config)
+        T = {r: np.eye(4, dtype=np.float64) for r in roots}
+
+        # parent -> joints
+        by_parent = {}
+        for j in robot_config.joints:
+            by_parent.setdefault(j.parent_link, []).append(j)
+
+        queue = list(roots)
+        visited = set(roots)
+        while queue:
+            parent = queue.pop(0)
+            for j in by_parent.get(parent, []):
+                child = j.child_link
+                if child in visited:
+                    continue
+                # origin
+                T_origin = np.eye(4, dtype=np.float64)
+                T_origin[:3, 3] = np.array(j.origin_xyz, dtype=np.float64)
+                T_origin[:3, :3] = self._rpy_to_matrix(j.origin_rpy[0], j.origin_rpy[1], j.origin_rpy[2])
+
+                # motion
+                q = float(joint_pos.get(j.name, 0.0))
+                T_motion = np.eye(4, dtype=np.float64)
+                if j.type in ("revolute", "continuous"):
+                    R = self._axis_angle_to_matrix(np.array(j.axis, dtype=np.float64), q)
+                    T_motion[:3, :3] = R
+                elif j.type == "prismatic":
+                    axis = np.array(j.axis, dtype=np.float64)
+                    n = np.linalg.norm(axis)
+                    if n > 1e-12:
+                        axis = axis / n
+                    T_motion[:3, 3] = axis * q
+
+                T_child = T[parent] @ T_origin @ T_motion
+                T[child] = T_child
+                visited.add(child)
+                queue.append(child)
+
+        return T
+
+    def _compute_parent_child_transforms(self, robot_config, joint_pos: dict) -> List[tuple]:
+        """计算每个关节的 parent->child 变换（用于发布正确的 TF 树）"""
+        transforms = []
+        for j in robot_config.joints:
+            # origin
+            T_origin = np.eye(4, dtype=np.float64)
+            T_origin[:3, 3] = np.array(j.origin_xyz, dtype=np.float64)
+            T_origin[:3, :3] = self._rpy_to_matrix(j.origin_rpy[0], j.origin_rpy[1], j.origin_rpy[2])
+
+            # motion
+            q = float(joint_pos.get(j.name, 0.0))
+            T_motion = np.eye(4, dtype=np.float64)
+            if j.type in ("revolute", "continuous"):
+                R = self._axis_angle_to_matrix(np.array(j.axis, dtype=np.float64), q)
+                T_motion[:3, :3] = R
+            elif j.type == "prismatic":
+                axis = np.array(j.axis, dtype=np.float64)
+                n = np.linalg.norm(axis)
+                if n > 1e-12:
+                    axis = axis / n
+                T_motion[:3, 3] = axis * q
+
+            T_parent_child = T_origin @ T_motion
+            transforms.append((j.parent_link, j.child_link, T_parent_child))
+
+        return transforms
+
+    def publish_tf(self, arm: ArmConfig, joint_positions: Optional[List[float]] = None) -> None:
+        """发布 TF（parent->child），让 RobotModel 能正确显示所有 link"""
+        if not self.config.publish_tf or self._tf_broadcaster is None:
+            return
+
+        robot_config = self._get_robot_config(arm)
+        if robot_config is None:
+            return
+
+        joint_names = self._get_joint_names_from_urdf(arm.urdf_path)
+        if joint_positions is None:
+            joint_positions = [0.0] * len(joint_names)
+
+        joint_pos = {n: float(p) for n, p in zip(joint_names, joint_positions)}
+        # 计算 parent->child 变换，用于正确的 TF 树
+        parent_child = self._compute_parent_child_transforms(robot_config, joint_pos)
+        # 保留 world 变换用于调试（不用于发布）
+        T = self._compute_world_link_transforms(robot_config, joint_pos)
+        self._last_world_transforms[arm.name] = T
+
+        now = self._node.get_clock().now().to_msg()
+        msgs = []
+        # root links 作为 frame_id 的子节点（若不同）
+        roots = self._get_root_links(robot_config)
+        for root in roots:
+            if root == self.config.frame_id:
+                continue
+            msg = self._TransformStamped()
+            msg.header.stamp = now
+            msg.header.frame_id = self.config.frame_id
+            msg.child_frame_id = root
+            msg.transform.translation.x = 0.0
+            msg.transform.translation.y = 0.0
+            msg.transform.translation.z = 0.0
+            msg.transform.rotation.x = 0.0
+            msg.transform.rotation.y = 0.0
+            msg.transform.rotation.z = 0.0
+            msg.transform.rotation.w = 1.0
+            msgs.append(msg)
+
+        # 关节 parent->child 变换
+        for parent, child, Tpc in parent_child:
+            msg = self._TransformStamped()
+            msg.header.stamp = now
+            msg.header.frame_id = parent
+            msg.child_frame_id = child
+            msg.transform.translation.x = float(Tpc[0, 3])
+            msg.transform.translation.y = float(Tpc[1, 3])
+            msg.transform.translation.z = float(Tpc[2, 3])
+            x, y, z, w = self._matrix_to_quaternion(Tpc[:3, :3])
+            msg.transform.rotation.x = float(x)
+            msg.transform.rotation.y = float(y)
+            msg.transform.rotation.z = float(z)
+            msg.transform.rotation.w = float(w)
+            msgs.append(msg)
+
+        # TransformBroadcaster 支持一次发送 list
+        self._tf_broadcaster.sendTransform(msgs)
 
     def load_arm_data(self, arm: ArmConfig) -> Optional[object]:
         """
@@ -175,6 +447,35 @@ class RVizReachabilityPublisher:
         else:
             manipulability = np.ones(len(grid_points))
 
+        # 尝试从 stats.json 加载元数据（包括 base_link）
+        base_link = ""
+        ee_link = ""
+        base_transform = None
+        points_frame = "base"
+        stats_file = os.path.join(arm.data_dir, f"{prefix}_stats.json")
+        if os.path.exists(stats_file):
+            try:
+                import json
+                with open(stats_file, 'r', encoding='utf-8') as f:
+                    stats = json.load(f)
+                    base_link = stats.get('base_link', '')
+                    ee_link = stats.get('ee_link', '')
+                    points_frame = stats.get('points_frame', points_frame)
+                    bt = stats.get('base_transform')
+                    if bt and 'translation' in bt and 'rotation' in bt:
+                        base_transform = {
+                            'translation': np.array(bt['translation'], dtype=np.float64),
+                            'rotation': np.array(bt['rotation'], dtype=np.float64),
+                        }
+                self._node.get_logger().info(
+                    f'{arm.name} 臂: 从 {stats_file} 加载元数据: '
+                    f'base_link="{base_link}", points_frame="{points_frame}"'
+                )
+            except Exception as e:
+                self._node.get_logger().warn(f'无法加载 stats.json: {e}')
+        else:
+            self._node.get_logger().warn(f'{arm.name} 臂: stats.json 不存在: {stats_file}')
+
         # 创建简化的 Result 对象
         class SimpleResult:
             pass
@@ -186,12 +487,121 @@ class RVizReachabilityPublisher:
         result.manipulability = manipulability
         result.reachable_count = int(np.sum(reachable_mask))
         result.color_override = arm.color_override
+        result.base_link = base_link  # 添加 base_link 用于正确的坐标系
+        result.ee_link = ee_link
+        result.base_transform = base_transform
+        result.points_frame = points_frame
 
         return result
+
+    def _resolve_urdf_package_paths(self, urdf_content: str, urdf_path: str) -> str:
+        """
+        将 URDF 中的 package:// 路径转换为绝对路径，并补全 mesh 的相对路径。
+
+        参数:
+            urdf_content: URDF 文件内容
+            urdf_path: URDF 文件路径
+
+        返回:
+            转换后的 URDF 内容
+        """
+        import re
+        import xml.etree.ElementTree as ET
+
+        urdf_dir = os.path.dirname(os.path.abspath(urdf_path))
+
+        def build_package_map() -> dict:
+            package_map = {}
+            env_paths = os.environ.get("ROS_PACKAGE_PATH", "")
+            for base in [p for p in env_paths.split(":") if p]:
+                if os.path.isdir(base):
+                    for entry in os.listdir(base):
+                        pkg_dir = os.path.join(base, entry)
+                        if os.path.isdir(pkg_dir):
+                            package_map[entry] = pkg_dir
+            # 兜底：URDF 同级或上级可能是 package 根目录
+            parent_dir = os.path.dirname(urdf_dir)
+            if os.path.isdir(parent_dir):
+                package_map.setdefault(os.path.basename(parent_dir), parent_dir)
+            package_map.setdefault(os.path.basename(urdf_dir), urdf_dir)
+            return package_map
+
+        package_map = build_package_map()
+
+        def _to_file_uri(abs_path: str) -> str:
+            # RViz/resource_retriever 走 URI 解析；路径里有空格等字符必须做 URL 编码
+            from urllib.parse import quote
+            abs_path = os.path.abspath(abs_path)
+            abs_path = abs_path.replace("\\", "/")
+            return "file://" + quote(abs_path, safe="/:")
+
+        def resolve_path(path: str) -> Optional[str]:
+            if path.startswith("package://"):
+                remainder = path[len("package://"):]
+                parts = remainder.split("/", 1)
+                if len(parts) == 2:
+                    package_name, relative_path = parts
+                    if package_name in package_map:
+                        candidate = os.path.join(package_map[package_name], relative_path)
+                        if os.path.exists(candidate):
+                            return os.path.abspath(candidate)
+                return None
+            if path.startswith("file://"):
+                abs_path = path[len("file://"):]
+                return abs_path if os.path.exists(abs_path) else None
+            if os.path.isabs(path):
+                return path if os.path.exists(path) else None
+            # 相对路径：优先 URDF 目录，再上一级
+            candidate = os.path.join(urdf_dir, path)
+            if os.path.exists(candidate):
+                return os.path.abspath(candidate)
+            candidate = os.path.join(os.path.dirname(urdf_dir), path)
+            if os.path.exists(candidate):
+                return os.path.abspath(candidate)
+            return None
+
+        # 1) 先替换所有 package:// 的资源路径
+        def replace_package_path(match):
+            package_path = match.group(0)
+            resolved_path = resolve_path(package_path)
+            if resolved_path:
+                return _to_file_uri(resolved_path)
+            return package_path
+
+        resolved = re.sub(r"package://[^\s\"<>]+", replace_package_path, urdf_content)
+
+        # 2) 再解析 XML，补全 mesh filename 的相对路径
+        try:
+            root = ET.fromstring(resolved)
+            updated = False
+            missing = []
+            for mesh in root.findall(".//mesh"):
+                filename = mesh.get("filename")
+                if not filename:
+                    continue
+                resolved_path = resolve_path(filename)
+                if resolved_path:
+                    mesh.set("filename", _to_file_uri(resolved_path))
+                    updated = True
+                else:
+                    missing.append(filename)
+            if missing:
+                self._node.get_logger().warn(
+                    f"URDF mesh 路径未找到: {len(missing)} 个（示例: {missing[:3]}）"
+                )
+            if updated:
+                resolved = ET.tostring(root, encoding="unicode")
+        except Exception as e:
+            self._node.get_logger().warn(f"解析 URDF 以补全 mesh 路径失败: {e}")
+
+        return resolved
 
     def publish_robot_description(self, arm: ArmConfig) -> None:
         """
         发布机器人描述 (URDF)
+
+        多臂模式：只发布一次完整的机器人URDF
+        单臂模式：正常发布
 
         参数:
             arm: 臂配置
@@ -199,16 +609,29 @@ class RVizReachabilityPublisher:
         if arm.name not in self._robot_desc_publishers:
             return
 
+        # 多臂模式：只发布一次
+        is_multi_arm = len(self.config.arms) > 1
+        if is_multi_arm and self._robot_desc_published:
+            return
+
         if not arm.urdf_path or not os.path.exists(arm.urdf_path):
             return
 
-        with open(arm.urdf_path, 'r') as f:
+        with open(arm.urdf_path, 'r', encoding='utf-8') as f:
             urdf_content = f.read()
+
+        # 将 package:// 路径转换为绝对路径
+        urdf_content = self._resolve_urdf_package_paths(urdf_content, arm.urdf_path)
 
         msg = self._String()
         msg.data = urdf_content
         self._robot_desc_publishers[arm.name].publish(msg)
-        self._node.get_logger().info(f'发布 {arm.name} 臂 robot_description')
+
+        if is_multi_arm:
+            self._node.get_logger().info(f'发布完整机器人 URDF 到 /robot_description')
+            self._robot_desc_published = True
+        else:
+            self._node.get_logger().info(f'发布 {arm.name} 臂 robot_description')
 
     def publish_joint_states(self, arm: ArmConfig, joint_positions: Optional[List[float]] = None) -> None:
         """
@@ -261,6 +684,9 @@ class RVizReachabilityPublisher:
         """
         发布点云
 
+        点云数据是相对于各臂的 base_link 坐标系计算的。
+        使用各臂的 base_link 作为 frame_id，ROS TF 会自动将点云显示在正确的 world 位置。
+
         参数:
             arm: 臂配置
             result: 可达性结果
@@ -268,19 +694,78 @@ class RVizReachabilityPublisher:
         if arm.name not in self._publishers:
             return
 
-        msg = self._create_pointcloud2(result)
-        self._publishers[arm.name].publish(msg)
-        self._node.get_logger().info(f'发布 {arm.name} 臂 PointCloud2: {result.reachable_count} 个点')
+        # 始终发布在 base_link 坐标系中，依赖 TF 将其变换到 world
+        points_frame = getattr(result, 'points_frame', 'base')
+        base_link = getattr(result, 'base_link', '')
+        base_transform = getattr(result, 'base_transform', None)
 
-    def _create_pointcloud2(self, result) -> 'PointCloud2':
-        """创建 PointCloud2 消息"""
+        if points_frame != "base":
+            self._node.get_logger().warn(
+                f"{arm.name} 臂: points_frame={points_frame}，但当前发布策略要求 base 坐标系；"
+                f"请用 base 坐标系结果重新分析"
+            )
+
+        # 确定 frame_id 和变换策略
+        if base_link:
+            # 正常情况：使用 base_link 作为 frame_id，依赖 TF 变换
+            frame_id = base_link
+            transform = None
+            self._node.get_logger().info(
+                f'{arm.name} 臂: 点云使用 frame_id={frame_id}（依赖 TF 变换到 world）'
+            )
+        elif base_transform is not None:
+            # Fallback: base_link 为空但有 base_transform，手动变换到 world
+            frame_id = self.config.frame_id
+            transform = self._base_transform_to_matrix(
+                base_transform,
+                self.config.use_base_transform_rotation
+            )
+            self._node.get_logger().warn(
+                f'{arm.name} 臂: base_link 为空，使用 base_transform 手动变换到 {frame_id}'
+            )
+        else:
+            # 无法确定正确变换，使用配置的 frame_id（可能位置不对）
+            frame_id = self.config.frame_id
+            transform = None
+            self._node.get_logger().warn(
+                f'{arm.name} 臂: base_link 为空且无 base_transform，'
+                f'使用 frame_id={frame_id}！点云位置可能不正确。'
+            )
+
+        msg = self._create_pointcloud2(result, transform=transform, frame_id=frame_id)
+        self._publishers[arm.name].publish(msg)
+        self._node.get_logger().info(f'发布 {arm.name} 臂 PointCloud2: {result.reachable_count} 个点 (frame: {frame_id})')
+
+    def _create_pointcloud2(self, result, transform: Optional[np.ndarray] = None, frame_id: Optional[str] = None) -> 'PointCloud2':
+        """
+        创建 PointCloud2 消息
+
+        如果提供了 transform 4x4矩阵，将点云从 arm 局部坐标系变换到 world 坐标系。
+        变换公式: p_world = R @ p_arm + t
+        """
         from .utils import colormap_dexterity
 
-        # 获取可达点
+        # 获取可达点（复制以避免修改原始数据）
         mask = result.reachable_mask
-        points = result.grid_points[mask]
+        points = result.grid_points[mask].copy().astype(np.float64)
         dexterity = result.dexterity[mask]
         manipulability = result.manipulability[mask]
+
+        # 应用完整变换：旋转 + 平移
+        if transform is not None:
+            R = transform[:3, :3]
+            t = transform[:3, 3]
+            # p_world = R @ p_arm + t
+            points = (R @ points.T).T + t
+            # 调试日志
+            self._node.get_logger().info(
+                f'变换后坐标范围: X[{points[:,0].min():.2f},{points[:,0].max():.2f}] '
+                f'Y[{points[:,1].min():.2f},{points[:,1].max():.2f}] '
+                f'Z[{points[:,2].min():.2f},{points[:,2].max():.2f}]'
+            )
+        
+        # 确保是 float32 用于 PointCloud2
+        points = points.astype(np.float32)
 
         # 计算颜色
         if hasattr(result, 'color_override') and result.color_override is not None:
@@ -313,7 +798,20 @@ class RVizReachabilityPublisher:
 
         # 创建 PointCloud2 消息
         msg = self._PointCloud2()
-        msg.header.frame_id = self.config.frame_id
+        # 使用臂的 base_link 作为坐标系（如果可用），否则使用配置的 frame_id
+        # 这样每个臂的点云都在其自己的 base_link 坐标系中
+        if frame_id:
+            msg.header.frame_id = frame_id
+        elif hasattr(result, 'base_link') and result.base_link:
+            msg.header.frame_id = result.base_link
+        else:
+            msg.header.frame_id = self.config.frame_id
+        # 日志输出，方便确认是否选错 base_link
+        if hasattr(self, "_node") and self._node is not None:
+            self._node.get_logger().info(
+                f"PointCloud2 frame_id 选择: {msg.header.frame_id} "
+                f"(result.base_link={getattr(result, 'base_link', '') or 'N/A'})"
+            )
         msg.header.stamp = self._node.get_clock().now().to_msg()
 
         # 字段定义
@@ -352,6 +850,12 @@ class RVizReachabilityPublisher:
 
             # 发布关节状态
             self.publish_joint_states(arm)
+            if arm.name in self._joint_state_publishers:
+                # 与 publish_joint_states 默认一致（全 0），用于 TF
+                joint_positions = None
+            else:
+                joint_positions = None
+            self.publish_tf(arm, joint_positions=joint_positions)
 
             # 加载并发布点云
             if arm.name in self._results:
@@ -363,6 +867,10 @@ class RVizReachabilityPublisher:
 
             if result:
                 self.publish_pointcloud(arm, result)
+                self._node.get_logger().info(
+                    f'已发布 {arm.name} 臂点云到 {self.config.base_topic}/points{arm.topic_suffix or ""} '
+                    f'({result.reachable_count} 点)'
+                )
 
     def spin(self) -> None:
         """持续发布模式"""
@@ -370,12 +878,19 @@ class RVizReachabilityPublisher:
 
         # 加载所有数据
         for arm in self.config.arms:
-            result = self.load_arm_data(arm)
-            if result:
-                self._results[arm.name] = result
+            # 若已有内存结果且未指定数据目录，直接复用；否则尝试从磁盘加载
+            if arm.name in self._results and arm.data_dir is None:
+                result = self._results[arm.name]
                 self._node.get_logger().info(
-                    f'加载 {arm.name} 臂数据: {result.reachable_count} 个可达点'
+                    f'使用内存中 {arm.name} 臂结果: {result.reachable_count} 个可达点'
                 )
+            else:
+                result = self.load_arm_data(arm)
+                if result:
+                    self._results[arm.name] = result
+                    self._node.get_logger().info(
+                        f'加载 {arm.name} 臂数据: {result.reachable_count} 个可达点'
+                    )
 
         # 发布一次机器人描述（latched）
         for arm in self.config.arms:
@@ -458,3 +973,105 @@ def load_and_publish(
 
     publisher = RVizReachabilityPublisher(config)
     publisher.spin()
+
+
+def _parse_args():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="从结果文件发布点云到 RViz2",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default="./reachability_output",
+        help="结果目录（包含 *_grid_points.npy 等文件）",
+    )
+    parser.add_argument(
+        "--prefix",
+        type=str,
+        default="reachability",
+        help="结果文件前缀",
+    )
+    parser.add_argument(
+        "--frame-id",
+        type=str,
+        default="world",
+        help="RViz 固定坐标系",
+    )
+    parser.add_argument(
+        "--topic",
+        type=str,
+        default="/reachability/points",
+        help="点云 Topic 名称",
+    )
+    parser.add_argument(
+        "--urdf",
+        type=str,
+        default=None,
+        help="URDF 文件路径（用于发布 robot_description，可选）",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="只发布一次后退出（默认持续发布）",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = _parse_args()
+
+    # 解析 topic，得到 base_topic 和可选后缀（保持与 visualize_rviz 一致）
+    if "/" in args.topic:
+        base_topic, last = args.topic.rsplit("/", 1)
+        base_topic = base_topic or "/"
+        if last.startswith("points"):
+            topic_suffix = last[len("points"):]
+        else:
+            topic_suffix = f"_{last}"
+    else:
+        base_topic = f"/{args.topic}" if not args.topic.startswith("/") else args.topic
+        topic_suffix = ""
+
+    arm = ArmConfig(
+        name="default",
+        urdf_path=args.urdf,
+        data_dir=args.data_dir,
+        data_prefix=args.prefix,
+        topic_suffix=topic_suffix,
+    )
+
+    config = RVizPublisherConfig(
+        frame_id=args.frame_id,
+        publish_rate=0.0 if args.once else 1.0,
+        base_topic=base_topic,
+        arms=[arm],
+    )
+
+    publisher = RVizReachabilityPublisher(config)
+    publisher.spin()
+
+
+class MultiArmRVizPublisher(RVizReachabilityPublisher):
+    """
+    多臂 RViz 发布器（兼容别名）
+
+    这是 RVizReachabilityPublisher 的别名，提供更直观的命名。
+    """
+
+    def run(self, publish_once: bool = False):
+        """
+        运行发布器
+
+        参数:
+            publish_once: 是否只发布一次
+        """
+        if publish_once:
+            self.config.publish_rate = 0.0
+        self.spin()
+
+
+if __name__ == "__main__":
+    main()

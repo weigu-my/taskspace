@@ -83,6 +83,10 @@ def main():
                         help='发布频率 (Hz)，0 表示只发布一次')
     parser.add_argument('--topic', type=str, default='/reachability',
                         help='基础 Topic 名称')
+    parser.add_argument('--no-tf', action='store_true',
+                        help='禁用 TF 发布（当 robot_state_publisher 已运行时使用）')
+    parser.add_argument('--translation-only', action='store_true',
+                        help='仅使用平移，不应用 base_transform 旋转（用于调试点云位置）')
 
     # 解析参数
     args, unknown = parser.parse_known_args()
@@ -106,6 +110,8 @@ def main():
     print(f"坐标系: {args.frame_id}")
     print(f"基础 Topic: {args.topic}")
     print(f"发布频率: {args.rate} Hz")
+    if args.translation_only:
+        print(f"变换模式: 仅平移（忽略 base_transform 旋转）")
     print("=" * 60)
 
     # 构建臂配置列表
@@ -165,9 +171,14 @@ def main():
         left_data = args.left_data or args.data_dir
         right_data = args.right_data or args.data_dir
 
+        # 使用共享的 URDF（如果单独的臂 URDF 未指定）
+        shared_urdf = args.urdf
+        left_urdf = args.left_urdf or shared_urdf
+        right_urdf = args.right_urdf or shared_urdf
+
         left_arm = ArmConfig(
             name="left",
-            urdf_path=args.left_urdf,
+            urdf_path=left_urdf,
             data_dir=left_data,
             data_prefix=args.left_prefix,
             topic_suffix="_left",
@@ -177,7 +188,7 @@ def main():
 
         right_arm = ArmConfig(
             name="right",
-            urdf_path=args.right_urdf,
+            urdf_path=right_urdf,
             data_dir=right_data,
             data_prefix=args.right_prefix,
             topic_suffix="_right",
@@ -223,8 +234,13 @@ def main():
         frame_id=args.frame_id,
         publish_rate=args.rate,
         base_topic=args.topic,
-        arms=arms
+        arms=arms,
+        publish_tf=not args.no_tf,  # 当 robot_state_publisher 运行时禁用 TF
+        use_base_transform_rotation=not args.translation_only
     )
+
+    if args.no_tf:
+        print("[TF] 禁用 TF 发布（依赖 robot_state_publisher）")
 
     publisher = RVizReachabilityPublisher(config)
 

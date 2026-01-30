@@ -2,6 +2,7 @@
 基于体素的可达性分析器
 
 本模块使用体素网格采样和GPU加速IK求解进行全面的可达性分析。
+支持单臂和多臂同时分析。
 """
 
 import os
@@ -11,16 +12,18 @@ import numpy as np
 import torch
 import gc
 from typing import Dict, List, Optional, Tuple, Any
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field
 
 from .config import (
     ReachabilityConfig,
     VoxelConfig,
     IKConfig,
     OrientationConfig,
-    OrientationMode
+    OrientationMode,
+    ArmMode,
+    MultiArmConfig
 )
-from .urdf_parser import URDFParser, RobotConfig
+from .urdf_parser import URDFParser, RobotConfig, ArmChain
 from .ik_solver import MultiSeedIKSolver, BatchIKResult
 from .manipulability import ManipulabilityCalculator
 from .utils import (
@@ -71,9 +74,21 @@ class ReachabilityResult:
     mean_manipulability: float
     computation_time: float
 
+    # 臂信息（用于多臂分析）
+    arm_name: str = ""
+    base_link: str = ""
+    ee_link: str = ""
+    color: Tuple[float, float, float] = (0.0, 1.0, 0.0)
+    base_transform: Optional[Dict[str, Any]] = None
+    points_frame: str = "base"
+
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典用于序列化"""
-        return {
+        data = {
+            'arm_name': self.arm_name,
+            'base_link': self.base_link,
+            'ee_link': self.ee_link,
+            'points_frame': self.points_frame,
             'total_points': self.total_points,
             'reachable_count': self.reachable_count,
             'reachability_ratio': self.reachability_ratio,
@@ -83,7 +98,39 @@ class ReachabilityResult:
             'mean_manipulability': float(self.mean_manipulability),
             'computation_time': self.computation_time,
             'grid_shape': list(self.grid_shape),
+            'color': list(self.color),
         }
+        if self.base_transform is not None:
+            data['base_transform'] = {
+                'translation': self.base_transform['translation'].tolist(),
+                'rotation': self.base_transform['rotation'].tolist()
+            }
+        return data
+
+
+@dataclass
+class MultiArmReachabilityResult:
+    """多臂可达性分析结果"""
+    results: Dict[str, ReachabilityResult]  # {臂名称: 结果}
+    urdf_path: str
+    total_computation_time: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典用于序列化"""
+        return {
+            'urdf_path': self.urdf_path,
+            'total_computation_time': self.total_computation_time,
+            'arms': {name: result.to_dict() for name, result in self.results.items()}
+        }
+
+    @property
+    def arm_names(self) -> List[str]:
+        """获取所有臂名称"""
+        return list(self.results.keys())
+
+    def get_result(self, arm_name: str) -> Optional[ReachabilityResult]:
+        """获取指定臂的结果"""
+        return self.results.get(arm_name)
 
 
 class ReachabilityAnalyzer:
@@ -98,15 +145,16 @@ class ReachabilityAnalyzer:
     5. 计算可操作度（Yoshikawa指标）
     """
 
-    def __init__(self, config: ReachabilityConfig):
+    def __init__(self, config: ReachabilityConfig, robot_config: RobotConfig = None):
         """
         初始化可达性分析器
 
         参数:
             config: 可达性分析配置
+            robot_config: 可选的预解析机器人配置（用于多臂分析）
         """
         self.config = config
-        self.robot_config: Optional[RobotConfig] = None
+        self.robot_config: Optional[RobotConfig] = robot_config
         self.ik_solver: Optional[MultiSeedIKSolver] = None
         self.manipulability_calc: Optional[ManipulabilityCalculator] = None
 
@@ -118,13 +166,16 @@ class ReachabilityAnalyzer:
         print("初始化可达性分析器")
         print("=" * 60)
 
-        # 解析URDF
-        print(f"\n[1/4] 解析URDF: {self.config.urdf_path}")
-        parser = URDFParser(self.config.urdf_path)
-        self.robot_config = parser.parse(
-            base_link=self.config.base_link,
-            ee_link=self.config.ee_link
-        )
+        # 解析URDF（如果没有提供预解析的配置）
+        if self.robot_config is None:
+            print(f"\n[1/4] 解析URDF: {self.config.urdf_path}")
+            parser = URDFParser(self.config.urdf_path)
+            self.robot_config = parser.parse(
+                base_link=self.config.base_link,
+                ee_link=self.config.ee_link
+            )
+        else:
+            print(f"\n[1/4] 使用预解析的机器人配置")
 
         print(f"  机器人: {self.robot_config.name}")
         print(f"  基座链接: {self.robot_config.base_link}")
@@ -153,10 +204,19 @@ class ReachabilityAnalyzer:
         # 自动检测工作空间边界
         if self.config.voxel.auto_detect:
             print(f"\n[4/4] 自动检测工作空间边界...")
-            x_range, y_range, z_range = self.ik_solver.estimate_workspace_bounds(
-                n_samples=self.config.voxel.fk_samples,
-                padding=self.config.voxel.padding
-            )
+            # 根据 points_frame 选择坐标系
+            if self.config.points_frame == "world":
+                print(f"  使用 world 坐标系")
+                x_range, y_range, z_range = self.ik_solver.estimate_workspace_bounds_world(
+                    n_samples=self.config.voxel.fk_samples,
+                    padding=self.config.voxel.padding
+                )
+            else:
+                print(f"  使用 base_link 坐标系")
+                x_range, y_range, z_range = self.ik_solver.estimate_workspace_bounds(
+                    n_samples=self.config.voxel.fk_samples,
+                    padding=self.config.voxel.padding
+                )
             self.config.voxel.x_range = x_range
             self.config.voxel.y_range = y_range
             self.config.voxel.z_range = z_range
@@ -201,9 +261,13 @@ class ReachabilityAnalyzer:
         else:
             raise ValueError(f"未知的姿态模式: {mode}")
 
-    def analyze(self) -> ReachabilityResult:
+    def analyze(self, arm_name: str = "", color: Tuple[float, float, float] = (0.0, 1.0, 0.0)) -> ReachabilityResult:
         """
         执行完整的可达性分析
+
+        参数:
+            arm_name: 臂名称（用于结果标识）
+            color: 可视化颜色
 
         返回:
             包含所有计算指标的ReachabilityResult
@@ -211,18 +275,27 @@ class ReachabilityAnalyzer:
         start_time = time.time()
 
         print("\n" + "=" * 60)
-        print("开始可达性分析")
+        if arm_name:
+            print(f"开始可达性分析 - {arm_name}")
+        else:
+            print("开始可达性分析")
         print("=" * 60)
 
         # 生成体素网格
+        # 当 points_frame="world" 时，voxel 范围已在 world 坐标系下设置
+        # 当 points_frame="base" 时，voxel 范围在 base_link 坐标系下
         print("\n[Step 1] 生成体素网格...")
         grid_points = self.config.voxel.get_grid_points()
         grid_shape = self.config.voxel.get_grid_shape()
         n_points = len(grid_points)
 
+        points_frame = self.config.points_frame
+        grid_points_for_ik = grid_points
+
         print(f"  网格形状: {grid_shape}")
         print(f"  分辨率: {self.config.voxel.resolution}m")
         print(f"  总体素数: {n_points}")
+        print(f"  点云坐标系: {points_frame}")
 
         # 生成姿态
         print("\n[Step 2] 生成姿态...")
@@ -232,11 +305,13 @@ class ReachabilityAnalyzer:
         print(f"  姿态数量: {n_orientations}")
 
         # 执行IK求解
+        # 当 points_frame="world" 时，grid_points 已经是 world 坐标系
         print("\n[Step 3] 求解所有位置和姿态的IK...")
         reachable_mask, dexterity, num_solutions = self.ik_solver.solve_batch_multi_orientation(
-            positions=grid_points,
+            positions=grid_points_for_ik,
             orientations=orientations,
-            batch_size=self.config.ik.batch_size
+            batch_size=self.config.ik.batch_size,
+            positions_in_world=(points_frame == "world")
         )
 
         reachable_points = grid_points[reachable_mask]
@@ -251,7 +326,7 @@ class ReachabilityAnalyzer:
         # 获取最优解用于可操作度计算
         print("\n[Step 4] 计算最优IK解...")
         best_solutions = self._compute_best_solutions(
-            grid_points, orientations, reachable_mask,
+            grid_points_for_ik, orientations, reachable_mask,
             batch_size=self.config.ik.batch_size
         )
 
@@ -277,6 +352,11 @@ class ReachabilityAnalyzer:
         reachable_dexterity = dexterity[reachable_mask]
         reachable_manip = manipulability[reachable_mask]
 
+        # 当 points_frame="world" 时，grid_points 已经在 world 坐标系下生成
+        # 无需额外转换
+        if points_frame == "world":
+            print(f"  点云已在 world 坐标系下生成")
+
         result = ReachabilityResult(
             grid_points=grid_points,
             grid_shape=grid_shape,
@@ -288,12 +368,18 @@ class ReachabilityAnalyzer:
             best_solutions=best_solutions,
             total_points=n_points,
             reachable_count=reachable_count,
-            reachability_ratio=reachable_count / n_points,
+            reachability_ratio=reachable_count / n_points if n_points > 0 else 0,
             max_dexterity=int(np.max(dexterity)) if reachable_count > 0 else 0,
             mean_dexterity=float(np.mean(reachable_dexterity)) if reachable_count > 0 else 0,
             max_manipulability=float(np.max(reachable_manip)) if reachable_count > 0 else 0,
             mean_manipulability=float(np.mean(reachable_manip)) if reachable_count > 0 else 0,
-            computation_time=computation_time
+            computation_time=computation_time,
+            arm_name=arm_name,
+            base_link=self.robot_config.base_link,
+            ee_link=self.robot_config.ee_link,
+            color=color,
+            base_transform=self.ik_solver.get_base_transform() if self.ik_solver else None,
+            points_frame=points_frame
         )
 
         print("\n" + "=" * 60)
@@ -427,13 +513,11 @@ class ReachabilityAnalyzer:
         stats = result.to_dict()
         stats['robot_name'] = self.robot_config.name
         stats['urdf_path'] = self.robot_config.urdf_path
-        stats['ee_link'] = self.robot_config.ee_link
-        stats['base_link'] = self.robot_config.base_link
         stats['num_dof'] = self.robot_config.num_dof
         stats['voxel_resolution'] = self.config.voxel.resolution
         stats['num_ik_seeds'] = self.config.ik.num_seeds
 
-        with open(os.path.join(output_dir, f"{prefix}_stats.json"), 'w') as f:
+        with open(os.path.join(output_dir, f"{prefix}_stats.json"), 'w', encoding='utf-8') as f:
             json.dump(stats, f, indent=2)
 
         print(f"  已保存: {prefix}_grid_points.npy")
@@ -483,6 +567,185 @@ class ReachabilityAnalyzer:
         return cls(config)
 
 
+class MultiArmReachabilityAnalyzer:
+    """
+    多臂可达性分析器
+
+    支持同时分析多条机械臂的可达空间。
+    """
+
+    def __init__(self, config: ReachabilityConfig):
+        """
+        初始化多臂分析器
+
+        参数:
+            config: 可达性分析配置
+        """
+        self.config = config
+        self.parser = URDFParser(config.urdf_path)
+        self.arm_chains: List[ArmChain] = []
+        self.results: Dict[str, ReachabilityResult] = {}
+
+        self._detect_arms()
+
+    def _detect_arms(self):
+        """检测URDF中的所有机械臂"""
+        print("=" * 60)
+        print("检测机械臂")
+        print("=" * 60)
+
+        self.arm_chains = self.parser.detect_arm_chains()
+
+        if not self.arm_chains:
+            print("  [警告] 未检测到机械臂链，将尝试使用默认解析")
+            return
+
+        print(f"\n检测到 {len(self.arm_chains)} 条机械臂:")
+        for chain in self.arm_chains:
+            print(f"  - {chain.name}:")
+            print(f"      基座: {chain.base_link}")
+            print(f"      末端: {chain.ee_link}")
+            print(f"      自由度: {chain.num_dof}")
+            print(f"      关节: {[j.name for j in chain.active_joints]}")
+
+    def get_arms_to_analyze(self) -> List[ArmChain]:
+        """根据配置获取要分析的机械臂列表"""
+        mode = self.config.multi_arm.mode
+
+        if mode == ArmMode.AUTO:
+            # 自动模式：返回第一条臂
+            return self.arm_chains[:1] if self.arm_chains else []
+
+        elif mode == ArmMode.LEFT:
+            # 仅左臂
+            return [c for c in self.arm_chains if c.name.lower() == 'left']
+
+        elif mode == ArmMode.RIGHT:
+            # 仅右臂
+            return [c for c in self.arm_chains if c.name.lower() == 'right']
+
+        elif mode == ArmMode.BOTH:
+            # 双臂（左右）
+            return [c for c in self.arm_chains if c.name.lower() in ['left', 'right']]
+
+        elif mode == ArmMode.ALL:
+            # 所有臂
+            return self.arm_chains
+
+        elif mode == ArmMode.SINGLE:
+            # 指定的单臂
+            arm_name = self.config.multi_arm.arm_name.lower()
+            return [c for c in self.arm_chains if c.name.lower() == arm_name]
+
+        return []
+
+    def analyze(self) -> MultiArmReachabilityResult:
+        """
+        执行多臂可达性分析
+
+        返回:
+            MultiArmReachabilityResult 包含所有臂的分析结果
+        """
+        start_time = time.time()
+
+        arms_to_analyze = self.get_arms_to_analyze()
+
+        if not arms_to_analyze:
+            print("[错误] 没有找到要分析的机械臂")
+            if self.arm_chains:
+                print(f"可用的臂: {[c.name for c in self.arm_chains]}")
+            return MultiArmReachabilityResult(
+                results={},
+                urdf_path=self.config.urdf_path,
+                total_computation_time=0
+            )
+
+        print("\n" + "=" * 60)
+        print(f"开始多臂可达性分析")
+        print(f"将分析 {len(arms_to_analyze)} 条臂: {[c.name for c in arms_to_analyze]}")
+        print("=" * 60)
+
+        results = {}
+
+        for idx, arm_chain in enumerate(arms_to_analyze):
+            print(f"\n{'='*60}")
+            print(f"分析臂 {idx+1}/{len(arms_to_analyze)}: {arm_chain.name}")
+            print(f"{'='*60}")
+
+            # 创建该臂的机器人配置
+            robot_config = RobotConfig(
+                name=f"{self.parser.get_robot_name()}_{arm_chain.name}",
+                joints=self.parser._joints,
+                links=self.parser._links,
+                base_link=arm_chain.base_link,
+                ee_link=arm_chain.ee_link,
+                urdf_path=self.parser.urdf_path,
+                urdf_dir=self.parser.urdf_dir,
+                chain_joints=arm_chain.chain_joints,
+                chain_links=arm_chain.chain_links
+            )
+
+            # 创建该臂的配置副本
+            arm_config = self.config.copy()
+            arm_config.base_link = arm_chain.base_link
+            arm_config.ee_link = arm_chain.ee_link
+            arm_config.output_dir = os.path.join(self.config.output_dir, arm_chain.name)
+
+            # 获取该臂的颜色
+            color = self.config.multi_arm.get_arm_color(arm_chain.name, idx)
+
+            # 创建分析器并执行分析
+            analyzer = ReachabilityAnalyzer(arm_config, robot_config)
+            result = analyzer.analyze(arm_name=arm_chain.name, color=color)
+
+            # 保存结果
+            prefix = f"reachability_{arm_chain.name}"
+            analyzer.save_results(result, prefix=prefix)
+
+            results[arm_chain.name] = result
+
+            # 清理GPU内存
+            clear_gpu_memory()
+
+        total_time = time.time() - start_time
+
+        # 打印汇总
+        print("\n" + "=" * 60)
+        print("多臂分析完成!")
+        print("=" * 60)
+        print(f"总时间: {total_time:.2f}秒")
+        print("\n各臂统计:")
+        for name, result in results.items():
+            print(f"  {name}:")
+            print(f"    可达点: {result.reachable_count} ({result.reachability_ratio*100:.1f}%)")
+            print(f"    最大灵活度: {result.max_dexterity}")
+            print(f"    平均可操作度: {result.mean_manipulability:.4f}")
+
+        multi_result = MultiArmReachabilityResult(
+            results=results,
+            urdf_path=self.config.urdf_path,
+            total_computation_time=total_time
+        )
+
+        # 保存汇总统计
+        self._save_summary(multi_result)
+
+        return multi_result
+
+    def _save_summary(self, result: MultiArmReachabilityResult):
+        """保存多臂分析汇总"""
+        output_dir = self.config.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+        summary = result.to_dict()
+        summary_path = os.path.join(output_dir, "multi_arm_summary.json")
+
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, indent=2)
+
+        print(f"\n已保存汇总: {summary_path}")
+
+
 def analyze_urdf(
     urdf_path: str,
     ee_link: str = "",
@@ -521,3 +784,39 @@ def analyze_urdf(
     analyzer.save_results(result)
 
     return result
+
+
+def analyze_multi_arm(
+    urdf_path: str,
+    arm_mode: ArmMode = ArmMode.BOTH,
+    resolution: float = 0.05,
+    num_seeds: int = 32,
+    output_dir: str = "./reachability_output",
+    device: str = "cuda:0"
+) -> MultiArmReachabilityResult:
+    """
+    多臂可达性分析的便捷函数
+
+    参数:
+        urdf_path: URDF文件路径
+        arm_mode: 臂分析模式 (AUTO/LEFT/RIGHT/BOTH/ALL)
+        resolution: 体素分辨率
+        num_seeds: IK种子数量
+        output_dir: 输出目录
+        device: 计算设备
+
+    返回:
+        MultiArmReachabilityResult
+    """
+    config = ReachabilityConfig(
+        urdf_path=urdf_path,
+        output_dir=output_dir,
+        device=device
+    )
+    config.voxel.resolution = resolution
+    config.voxel.auto_detect = True
+    config.ik.num_seeds = num_seeds
+    config.multi_arm.mode = arm_mode
+
+    analyzer = MultiArmReachabilityAnalyzer(config)
+    return analyzer.analyze()
