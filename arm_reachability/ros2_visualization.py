@@ -699,12 +699,6 @@ class RVizReachabilityPublisher:
         base_link = getattr(result, 'base_link', '')
         base_transform = getattr(result, 'base_transform', None)
 
-        if points_frame != "base":
-            self._node.get_logger().warn(
-                f"{arm.name} 臂: points_frame={points_frame}，但当前发布策略要求 base 坐标系；"
-                f"请用 base 坐标系结果重新分析"
-            )
-
         # 确定 frame_id 和变换策略
         if base_link:
             # 正常情况：使用 base_link 作为 frame_id，依赖 TF 变换

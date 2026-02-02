@@ -34,9 +34,10 @@ class VoxelConfig:
     """体素网格配置 - 用于工作空间采样"""
 
     # 工作空间边界 [最小值, 最大值]，单位：米
-    x_range: Tuple[float, float] = (-2.0, 2.0)
-    y_range: Tuple[float, float] = (-2.0, 2.0)
-    z_range: Tuple[float, float] = (-0.5, 2.5)
+    # 默认范围较大，适合大多数机器人；auto_detect=True 时会自动调整
+    x_range: Tuple[float, float] = (-2.5, 2.5)
+    y_range: Tuple[float, float] = (-2.5, 2.5)
+    z_range: Tuple[float, float] = (-0.5, 3.0)
 
     # 体素分辨率（米）
     resolution: float = 0.05
@@ -46,7 +47,7 @@ class VoxelConfig:
 
     # FK采样参数（用于自动检测）
     fk_samples: int = 10000
-    padding: float = 0.3  # 边界填充比例（大模型更稳）
+    padding: float = 0.5  # 边界填充比例（50% 确保覆盖完整可达空间）
 
     def get_grid_points(self) -> np.ndarray:
         """生成体素网格中心点"""
