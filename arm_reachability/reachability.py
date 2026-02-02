@@ -527,6 +527,16 @@ class ReachabilityAnalyzer:
         print(f"  已保存: {prefix}_data.csv")
         print(f"  已保存: {prefix}_stats.json")
 
+        # 打印关键坐标系信息，方便用户确认
+        print(f"\n  坐标系信息:")
+        print(f"    base_link: {result.base_link}")
+        print(f"    points_frame: {result.points_frame}")
+        if result.base_transform is not None:
+            t = result.base_transform['translation']
+            print(f"    base_transform: 已保存 (base_link 在 world 中的位置: [{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}])")
+        else:
+            print(f"    base_transform: 未设置 (警告：RViz 可视化可能需要依赖 TF 链)")
+
     @classmethod
     def from_urdf(
         cls,

@@ -467,10 +467,22 @@ class RVizReachabilityPublisher:
                             'translation': np.array(bt['translation'], dtype=np.float64),
                             'rotation': np.array(bt['rotation'], dtype=np.float64),
                         }
+                # 记录加载的元数据
                 self._node.get_logger().info(
                     f'{arm.name} 臂: 从 {stats_file} 加载元数据: '
                     f'base_link="{base_link}", points_frame="{points_frame}"'
                 )
+                if base_transform:
+                    t = base_transform['translation']
+                    self._node.get_logger().info(
+                        f'{arm.name} 臂: base_transform 已加载，base_link 在 world 中的位置: '
+                        f'[{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}]'
+                    )
+                else:
+                    self._node.get_logger().warn(
+                        f'{arm.name} 臂: 未找到 base_transform，'
+                        f'点云可能需要依赖 TF 变换（可能导致位置不正确）'
+                    )
             except Exception as e:
                 self._node.get_logger().warn(f'无法加载 stats.json: {e}')
         else:
@@ -685,7 +697,10 @@ class RVizReachabilityPublisher:
         发布点云
 
         点云数据是相对于各臂的 base_link 坐标系计算的。
-        使用各臂的 base_link 作为 frame_id，ROS TF 会自动将点云显示在正确的 world 位置。
+
+        重要：为了避免 TF 链不完整导致点云显示在错误位置，
+        始终使用 base_transform 将点云变换到 world 坐标系，
+        然后使用 world 作为 frame_id。
 
         参数:
             arm: 臂配置
@@ -694,34 +709,44 @@ class RVizReachabilityPublisher:
         if arm.name not in self._publishers:
             return
 
-        # 始终发布在 base_link 坐标系中，依赖 TF 将其变换到 world
         points_frame = getattr(result, 'points_frame', 'base')
         base_link = getattr(result, 'base_link', '')
         base_transform = getattr(result, 'base_transform', None)
 
-        if points_frame != "base":
-            self._node.get_logger().warn(
-                f"{arm.name} 臂: points_frame={points_frame}，但当前发布策略要求 base 坐标系；"
-                f"请用 base 坐标系结果重新分析"
-            )
-
         # 确定 frame_id 和变换策略
-        if base_link:
-            # 正常情况：使用 base_link 作为 frame_id，依赖 TF 变换
-            frame_id = base_link
+        # 策略：始终使用 base_transform 将点云变换到 world 坐标系
+        # 这避免了依赖 TF 链的完整性，更加可靠
+
+        if points_frame == "world":
+            # 点云已经在 world 坐标系，直接发布
+            frame_id = self.config.frame_id
             transform = None
             self._node.get_logger().info(
-                f'{arm.name} 臂: 点云使用 frame_id={frame_id}（依赖 TF 变换到 world）'
+                f'{arm.name} 臂: 点云已在 world 坐标系，frame_id={frame_id}'
             )
         elif base_transform is not None:
-            # Fallback: base_link 为空但有 base_transform，手动变换到 world
+            # 使用 base_transform 将点云从 base_link 变换到 world
             frame_id = self.config.frame_id
             transform = self._base_transform_to_matrix(
                 base_transform,
                 self.config.use_base_transform_rotation
             )
+            self._node.get_logger().info(
+                f'{arm.name} 臂: 使用 base_transform 将点云从 {base_link or "base"} 变换到 {frame_id}'
+            )
+            if base_transform:
+                t = base_transform.get('translation', [0, 0, 0])
+                self._node.get_logger().info(
+                    f'{arm.name} 臂: base_link 位置: [{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}]'
+                )
+        elif base_link:
+            # Fallback: 有 base_link 但没有 base_transform
+            # 尝试依赖 TF，但警告用户
+            frame_id = base_link
+            transform = None
             self._node.get_logger().warn(
-                f'{arm.name} 臂: base_link 为空，使用 base_transform 手动变换到 {frame_id}'
+                f'{arm.name} 臂: 无 base_transform，使用 frame_id={frame_id} 依赖 TF。'
+                f'如果点云位置不正确，请重新运行分析以生成 base_transform。'
             )
         else:
             # 无法确定正确变换，使用配置的 frame_id（可能位置不对）
