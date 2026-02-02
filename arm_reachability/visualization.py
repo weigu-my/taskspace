@@ -676,7 +676,8 @@ class ReachabilityVisualizer:
         self,
         frame_id: str = "world",
         topic: str = "/reachability/points",
-        keep_alive: bool = True
+        keep_alive: bool = True,
+        color_mode: str = "dexterity"
     ):
         """
         将当前可达性结果发布到 RViz2
@@ -721,6 +722,7 @@ class ReachabilityVisualizer:
             publish_rate=1.0 if keep_alive else 0.0,
             base_topic=base_topic,
             arms=[arm],
+            color_mode=color_mode,
         )
 
         publisher = RVizReachabilityPublisher(config)

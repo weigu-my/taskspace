@@ -30,6 +30,7 @@ BASE_LINK=""
 EE_LINK=""
 RESOLUTION=0.05
 ARM_MODE="auto"
+ARM_NAME=""
 SKIP_ANALYSIS=false
 CLEAN_ROS=false
 KILL_RVIZ=false
@@ -38,6 +39,29 @@ TRANSLATION_ONLY=false
 PUBLISH_TF=false
 CLEAN_ROS=false
 KILL_RVIZ=false
+OUTPUT_DIR=""
+PREFIX="reachability"
+AUTO_BOUNDS=true
+X_RANGE_MIN=""
+X_RANGE_MAX=""
+Y_RANGE_MIN=""
+Y_RANGE_MAX=""
+Z_RANGE_MIN=""
+Z_RANGE_MAX=""
+NUM_SEEDS=32
+BATCH_SIZE=1024
+POS_THRESHOLD=0.005
+ROT_THRESHOLD=0.05
+ORIENTATION_MODE="multi_fixed"
+NUM_ORIENTATIONS=6
+DEVICE="cuda:0"
+NO_MANIPULABILITY=false
+CONFIG_PATH=""
+RVIZ_FRAME="world"
+RVIZ_TOPIC="/reachability/points"
+RVIZ_RATE=1.0
+RVIZ_ONCE=false
+RVIZ_COLOR_MODE="dexterity"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 show_help() {
@@ -45,12 +69,33 @@ show_help() {
     echo ""
     echo "选项:"
     echo "  --arm MODE          分析模式: auto/left/right/both/all (默认: auto)"
+    echo "  --arm-name NAME     指定单臂名称（配合 --arm single）"
     echo "  --base-link NAME    基座链接名"
     echo "  --ee-link NAME      末端执行器链接名"
     echo "  --resolution FLOAT  体素分辨率 (默认: 0.05)"
-    echo "  --points-frame F    点云坐标系: base/world (默认: base)"
+    echo "  --points-frame F    点云坐标系: base/world (默认: world)"
+    echo "  --x-range MIN MAX   X 轴范围"
+    echo "  --y-range MIN MAX   Y 轴范围"
+    echo "  --z-range MIN MAX   Z 轴范围"
+    echo "  --no-auto-bounds    禁用自动检测工作空间边界"
+    echo "  --num-seeds N       IK 种子数量"
+    echo "  --batch-size N      IK 批处理大小"
+    echo "  --pos-threshold V   IK 位置误差阈值"
+    echo "  --rot-threshold V   IK 旋转误差阈值"
+    echo "  --orientation-mode M 姿态模式: fixed/multi_fixed/spherical/random"
+    echo "  --num-orientations N 姿态采样数量（spherical/random）"
+    echo "  --device DEV        计算设备 (默认: cuda:0)"
+    echo "  --no-manipulability 跳过可操作度计算"
+    echo "  --output DIR        输出目录（默认: reachability_output_<URDF>）"
+    echo "  --prefix NAME       输出文件前缀（默认: reachability）"
+    echo "  --config PATH       YAML 配置文件路径"
     echo "  --translation-only  发布时仅平移，不应用 base_transform 旋转"
     echo "  --publish-tf        使用点云发布器发布 TF（将不启动 robot_state_publisher）"
+    echo "  --rviz-color-mode M RViz 颜色模式: dexterity/arm/tint (默认: dexterity)"
+    echo "  --rviz-frame F      RViz Fixed Frame (默认: world)"
+    echo "  --rviz-topic T      RViz 点云 Topic (如 /reachability/points)"
+    echo "  --rviz-rate Hz      RViz 发布频率 (0 表示只发布一次)"
+    echo "  --rviz-once         RViz 仅发布一次（等同 --rviz-rate 0）"
     echo "  --skip-analysis     跳过可达性分析，直接可视化已有数据"
     echo "  --clean-ros         清理 ROS2 缓存并重启 daemon（会清空 ~/.ros）"
     echo "  --kill-rviz         启动前先关闭已有 rviz2"
@@ -76,12 +121,33 @@ shift
 while [[ $# -gt 0 ]]; do
     case $1 in
         --arm) ARM_MODE="$2"; shift 2 ;;
+        --arm-name) ARM_NAME="$2"; shift 2 ;;
         --base-link) BASE_LINK="$2"; shift 2 ;;
         --ee-link) EE_LINK="$2"; shift 2 ;;
         --resolution) RESOLUTION="$2"; shift 2 ;;
         --points-frame) POINTS_FRAME="$2"; shift 2 ;;
+        --x-range) X_RANGE_MIN="$2"; X_RANGE_MAX="$3"; shift 3 ;;
+        --y-range) Y_RANGE_MIN="$2"; Y_RANGE_MAX="$3"; shift 3 ;;
+        --z-range) Z_RANGE_MIN="$2"; Z_RANGE_MAX="$3"; shift 3 ;;
+        --no-auto-bounds) AUTO_BOUNDS=false; shift ;;
+        --num-seeds) NUM_SEEDS="$2"; shift 2 ;;
+        --batch-size) BATCH_SIZE="$2"; shift 2 ;;
+        --pos-threshold) POS_THRESHOLD="$2"; shift 2 ;;
+        --rot-threshold) ROT_THRESHOLD="$2"; shift 2 ;;
+        --orientation-mode) ORIENTATION_MODE="$2"; shift 2 ;;
+        --num-orientations) NUM_ORIENTATIONS="$2"; shift 2 ;;
+        --device) DEVICE="$2"; shift 2 ;;
+        --no-manipulability) NO_MANIPULABILITY=true; shift ;;
+        --output) OUTPUT_DIR="$2"; shift 2 ;;
+        --prefix) PREFIX="$2"; shift 2 ;;
+        --config) CONFIG_PATH="$2"; shift 2 ;;
         --translation-only) TRANSLATION_ONLY=true; shift ;;
         --publish-tf) PUBLISH_TF=true; shift ;;
+        --rviz-color-mode|--color-mode) RVIZ_COLOR_MODE="$2"; shift 2 ;;
+        --rviz-frame) RVIZ_FRAME="$2"; shift 2 ;;
+        --rviz-topic) RVIZ_TOPIC="$2"; shift 2 ;;
+        --rviz-rate) RVIZ_RATE="$2"; shift 2 ;;
+        --rviz-once) RVIZ_ONCE=true; shift ;;
         --skip-analysis) SKIP_ANALYSIS=true; shift ;;
         --clean-ros) CLEAN_ROS=true; shift ;;
         --kill-rviz) KILL_RVIZ=true; shift ;;
@@ -99,6 +165,32 @@ URDF_ABS=$(realpath "$URDF_PATH")
 URDF_DIR=$(dirname "$URDF_ABS")
 URDF_BASENAME=$(basename "$URDF_ABS" .urdf)
 
+# 默认输出目录
+if [ -z "$OUTPUT_DIR" ]; then
+    OUTPUT_DIR="$SCRIPT_DIR/reachability_output_${URDF_BASENAME}"
+fi
+
+# RViz 发布频率：若指定一次发布，则强制 0
+if [ "$RVIZ_ONCE" = true ]; then
+    RVIZ_RATE=0.0
+fi
+
+# RViz topic 处理：允许传入 /reachability/points，自动转换为 base topic
+RVIZ_BASE_TOPIC="$RVIZ_TOPIC"
+if [[ "$RVIZ_BASE_TOPIC" != /* ]]; then
+    RVIZ_BASE_TOPIC="/$RVIZ_BASE_TOPIC"
+fi
+if [[ "$RVIZ_BASE_TOPIC" == */* ]]; then
+    LAST_SEG="${RVIZ_BASE_TOPIC##*/}"
+    BASE_SEG="${RVIZ_BASE_TOPIC%/*}"
+    if [[ "$LAST_SEG" == points* ]]; then
+        RVIZ_BASE_TOPIC="$BASE_SEG"
+        if [ -z "$RVIZ_BASE_TOPIC" ]; then
+            RVIZ_BASE_TOPIC="/"
+        fi
+    fi
+fi
+
 # 自动检测 ROS 包目录 (用于解析 package:// 路径)
 # URDF 结构通常是: package_name/urdf/robot.urdf
 PACKAGE_DIR=$(dirname "$URDF_DIR")
@@ -111,6 +203,10 @@ echo "URDF: $URDF_ABS"
 echo "包目录: $PACKAGE_DIR"
 echo "分析模式: $ARM_MODE"
 echo "跳过分析: $SKIP_ANALYSIS"
+echo "输出目录: $OUTPUT_DIR"
+echo "RViz Fixed Frame: $RVIZ_FRAME"
+echo "RViz Topic: $RVIZ_TOPIC"
+echo "RViz 颜色模式: $RVIZ_COLOR_MODE"
 echo "============================================================"
 
 # 确保 ROS2 环境
@@ -192,7 +288,6 @@ PYEOF
 }
 
 # Step 2: 设置输出目录
-OUTPUT_DIR="$SCRIPT_DIR/reachability_output_${URDF_BASENAME}"
 print_info "输出目录: $OUTPUT_DIR"
 
 # Step 3: 运行可达性分析（如果需要）
@@ -200,12 +295,36 @@ if [ "$SKIP_ANALYSIS" = false ]; then
     print_info "步骤 2: 运行可达性分析..."
 
     # 构建命令参数
-    ANALYSIS_ARGS="--urdf '$URDF_ABS' --arm $ARM_MODE --resolution $RESOLUTION --points-frame $POINTS_FRAME --output '$OUTPUT_DIR' --no-visualization"
+    ANALYSIS_ARGS="--urdf '$URDF_ABS' --arm $ARM_MODE --resolution $RESOLUTION --points-frame $POINTS_FRAME --output '$OUTPUT_DIR' --prefix '$PREFIX' --no-visualization"
+    if [ -n "$ARM_NAME" ]; then
+        ANALYSIS_ARGS="$ANALYSIS_ARGS --arm-name '$ARM_NAME'"
+    fi
     if [ -n "$BASE_LINK" ]; then
         ANALYSIS_ARGS="$ANALYSIS_ARGS --base-link '$BASE_LINK'"
     fi
     if [ -n "$EE_LINK" ]; then
         ANALYSIS_ARGS="$ANALYSIS_ARGS --ee-link '$EE_LINK'"
+    fi
+    if [ -n "$X_RANGE_MIN" ] && [ -n "$X_RANGE_MAX" ]; then
+        ANALYSIS_ARGS="$ANALYSIS_ARGS --x-range $X_RANGE_MIN $X_RANGE_MAX"
+    fi
+    if [ -n "$Y_RANGE_MIN" ] && [ -n "$Y_RANGE_MAX" ]; then
+        ANALYSIS_ARGS="$ANALYSIS_ARGS --y-range $Y_RANGE_MIN $Y_RANGE_MAX"
+    fi
+    if [ -n "$Z_RANGE_MIN" ] && [ -n "$Z_RANGE_MAX" ]; then
+        ANALYSIS_ARGS="$ANALYSIS_ARGS --z-range $Z_RANGE_MIN $Z_RANGE_MAX"
+    fi
+    if [ "$AUTO_BOUNDS" = false ]; then
+        ANALYSIS_ARGS="$ANALYSIS_ARGS --no-auto-bounds"
+    fi
+    ANALYSIS_ARGS="$ANALYSIS_ARGS --num-seeds $NUM_SEEDS --batch-size $BATCH_SIZE --pos-threshold $POS_THRESHOLD --rot-threshold $ROT_THRESHOLD"
+    ANALYSIS_ARGS="$ANALYSIS_ARGS --orientation-mode $ORIENTATION_MODE --num-orientations $NUM_ORIENTATIONS"
+    ANALYSIS_ARGS="$ANALYSIS_ARGS --device $DEVICE"
+    if [ "$NO_MANIPULABILITY" = true ]; then
+        ANALYSIS_ARGS="$ANALYSIS_ARGS --no-manipulability"
+    fi
+    if [ -n "$CONFIG_PATH" ]; then
+        ANALYSIS_ARGS="$ANALYSIS_ARGS --config '$CONFIG_PATH'"
     fi
 
     cd "$SCRIPT_DIR"
@@ -309,7 +428,10 @@ if [ "$ARM_MODE" = "both" ] || [ "$ARM_MODE" = "all" ]; then
         --left-data "$LEFT_DATA" --left-prefix "reachability_left" \
         --right-data "$RIGHT_DATA" --right-prefix "reachability_right" \
         --urdf "$URDF_ABS" \
-        --frame-id world \
+        --frame-id "$RVIZ_FRAME" \
+        --topic "$RVIZ_BASE_TOPIC" \
+        --rate "$RVIZ_RATE" \
+        --color-mode "$RVIZ_COLOR_MODE" \
         $TRANSFORM_FLAG $TF_FLAG \
         
         > /tmp/rviz_pub.log 2>&1 &
@@ -345,7 +467,10 @@ elif [ "$ARM_MODE" = "left" ]; then
         --arm left \
         --left-data "$LEFT_DATA" --left-prefix "reachability_left" \
         --urdf "$URDF_ABS" \
-        --frame-id world \
+        --frame-id "$RVIZ_FRAME" \
+        --topic "$RVIZ_BASE_TOPIC" \
+        --rate "$RVIZ_RATE" \
+        --color-mode "$RVIZ_COLOR_MODE" \
         $TRANSFORM_FLAG $TF_FLAG \
         
         > /tmp/rviz_pub.log 2>&1 &
@@ -376,7 +501,10 @@ elif [ "$ARM_MODE" = "right" ]; then
         --arm right \
         --right-data "$RIGHT_DATA" --right-prefix "reachability_right" \
         --urdf "$URDF_ABS" \
-        --frame-id world \
+        --frame-id "$RVIZ_FRAME" \
+        --topic "$RVIZ_BASE_TOPIC" \
+        --rate "$RVIZ_RATE" \
+        --color-mode "$RVIZ_COLOR_MODE" \
         $TRANSFORM_FLAG $TF_FLAG \
         > /tmp/rviz_pub.log 2>&1 &
     PUB_PID=$!
@@ -387,7 +515,7 @@ elif [ "$ARM_MODE" = "right" ]; then
 else
     # 单臂/自动模式
     print_info "计算点云 world 坐标范围..."
-    print_pointcloud_range "arm" "$OUTPUT_DIR" "reachability"
+    print_pointcloud_range "arm" "$OUTPUT_DIR" "$PREFIX"
 
     TRANSFORM_FLAG=""
     if [ "$TRANSLATION_ONLY" = true ]; then
@@ -399,9 +527,12 @@ else
     fi
     python3 arm_reachability/rviz_publisher_node.py \
         --arm single \
-        --data-dir "$OUTPUT_DIR" --prefix "reachability" \
+        --data-dir "$OUTPUT_DIR" --prefix "$PREFIX" \
         --urdf "$URDF_ABS" \
-        --frame-id world \
+        --frame-id "$RVIZ_FRAME" \
+        --topic "$RVIZ_BASE_TOPIC" \
+        --rate "$RVIZ_RATE" \
+        --color-mode "$RVIZ_COLOR_MODE" \
         $TRANSFORM_FLAG $TF_FLAG \
         > /tmp/rviz_pub.log 2>&1 &
     PUB_PID=$!

@@ -49,6 +49,12 @@ class RVizPublisherConfig:
     # 是否使用透明度编码可操作度
     use_alpha_for_manipulability: bool = True
 
+    # 颜色模式:
+    # - "dexterity": 使用灵活度颜色映射
+    # - "arm": 固定使用每个臂的 color_override
+    # - "tint": 灵活度颜色映射 + 臂颜色轻微偏色
+    color_mode: str = "dexterity"
+
     # 臂配置列表
     arms: List[ArmConfig] = field(default_factory=list)
 
@@ -762,12 +768,22 @@ class RVizReachabilityPublisher:
         points = points.astype(np.float32)
 
         # 计算颜色
-        if hasattr(result, 'color_override') and result.color_override is not None:
+        color_mode = getattr(self.config, "color_mode", "dexterity")
+        if color_mode not in ("dexterity", "arm", "tint"):
+            color_mode = "dexterity"
+        override = getattr(result, 'color_override', None)
+
+        if color_mode == "arm" and override is not None:
             # 使用覆盖颜色
-            r, g, b = result.color_override
+            r, g, b = override
             colors = np.tile([[r, g, b]], (len(points), 1))
         else:
             colors = colormap_dexterity(dexterity)  # [n, 3] RGB in [0,1]
+            if color_mode == "tint" and override is not None:
+                # 轻微偏色，仍保留灵活度色阶
+                tint = np.array(override, dtype=np.float64).reshape(1, 3)
+                colors = 0.7 * colors + 0.3 * tint
+                colors = np.clip(colors, 0.0, 1.0)
 
         # 计算透明度（编码可操作度）
         if self.config.use_alpha_for_manipulability:

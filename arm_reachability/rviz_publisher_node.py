@@ -87,6 +87,9 @@ def main():
                         help='禁用 TF 发布（当 robot_state_publisher 已运行时使用）')
     parser.add_argument('--translation-only', action='store_true',
                         help='仅使用平移，不应用 base_transform 旋转（用于调试点云位置）')
+    parser.add_argument('--color-mode', type=str, default='dexterity',
+                        choices=['dexterity', 'arm', 'tint'],
+                        help='颜色模式: dexterity(灵活度色阶), arm(固定臂色), tint(臂色偏色+灵活度)')
 
     # 解析参数
     args, unknown = parser.parse_known_args()
@@ -110,6 +113,7 @@ def main():
     print(f"坐标系: {args.frame_id}")
     print(f"基础 Topic: {args.topic}")
     print(f"发布频率: {args.rate} Hz")
+    print(f"颜色模式: {args.color_mode}")
     if args.translation_only:
         print(f"变换模式: 仅平移（忽略 base_transform 旋转）")
     print("=" * 60)
@@ -236,7 +240,8 @@ def main():
         base_topic=args.topic,
         arms=arms,
         publish_tf=not args.no_tf,  # 当 robot_state_publisher 运行时禁用 TF
-        use_base_transform_rotation=not args.translation_only
+        use_base_transform_rotation=not args.translation_only,
+        color_mode=args.color_mode
     )
 
     if args.no_tf:

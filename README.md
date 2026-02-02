@@ -10,10 +10,14 @@
 - **体素空间采样**：基于体素网格的工作空间采样，支持自动边界检测
 - **灵活度分析 (Dexterity)**：计算每个位置可达的姿态数量
 - **可操作度分析 (Manipulability)**：计算 Yoshikawa 可操作度指标
-- **交互式可视化**：
+- **交互式可视化（Plotly/Matplotlib）**：
   - 点的 **大小** 表示可操作度
   - 点的 **颜色** 表示灵活度
   - 机器人 mesh 模型渲染
+- **RViz2 点云可视化**：
+  - 点的 **颜色** 表示灵活度（dexterity 色阶）
+  - 点的 **透明度** 表示可操作度（alpha）
+  - 点大小在 RViz 中统一设置（PointCloud2 不支持逐点尺寸）
 
 ## 安装依赖
 
@@ -47,12 +51,20 @@ python main.py --urdf robot.urdf \
     --resolution 0.05 \
     --num-seeds 32 \
     --orientation-mode multi_fixed \
+    --points-frame world \
     --output ./results
 
 # 指定末端执行器和基座链接
 python main.py --urdf robot.urdf \
     --ee-link tool0 \
     --base-link base_link
+
+# 启动 RViz2 点云可视化（需要 ROS 2 环境）
+python main.py --urdf robot.urdf \
+    --arm both \
+    --rviz \
+    --rviz-frame world \
+    --rviz-color-mode dexterity
 
 # 使用配置文件
 python main.py --urdf robot.urdf --config config.yaml
@@ -102,6 +114,61 @@ visualizer.visualize_plotly(
 # 生成汇总图
 visualizer.create_summary_plot(save_path="summary.png")
 ```
+
+### RViz2 可视化（ROS 2）
+
+需要已安装并 source ROS 2 环境。
+
+#### 方式 1：分析完成后直接发布
+
+```bash
+python main.py --urdf robot.urdf --arm both --rviz \
+    --rviz-topic /reachability/points \
+    --rviz-frame world \
+    --rviz-color-mode dexterity
+```
+
+`--rviz-color-mode` 可选值：
+- `dexterity`：按灵活度上色（默认）
+- `arm`：使用臂固定颜色
+- `tint`：在灵活度色阶上加入臂颜色偏色
+
+#### 方式 2：从已保存结果发布
+
+```bash
+python arm_reachability/rviz_publisher_node.py \
+  --arm both \
+  --left-data ./reachability_output/left --left-prefix reachability_left \
+  --right-data ./reachability_output/right --right-prefix reachability_right \
+  --urdf ./robot.urdf \
+  --frame-id world \
+  --color-mode dexterity
+```
+
+也可以使用一键脚本：`./launch_reachability_rviz.sh <URDF路径> [选项]`
+
+常用示例：
+
+```bash
+# 双臂分析 + RViz，可设置颜色模式/坐标系/发布频率
+./launch_reachability_rviz.sh robot_model/urdf/wheel_robot.urdf \
+  --arm both \
+  --points-frame world \
+  --resolution 0.05 \
+  --rviz-frame world \
+  --rviz-topic /reachability/points \
+  --rviz-rate 1.0 \
+  --rviz-color-mode tint
+
+# 跳过分析，直接发布已有结果
+./launch_reachability_rviz.sh robot_model/urdf/wheel_robot.urdf \
+  --arm both \
+  --skip-analysis \
+  --rviz-color-mode dexterity
+```
+
+脚本已支持常用分析参数（分辨率、种子数、姿态模式、工作空间范围等）和 RViz 参数
+（fixed frame / topic / rate / color mode）。完整参数请运行 `./launch_reachability_rviz.sh -h`。
 
 ## 项目结构
 
@@ -163,6 +230,7 @@ example.py                # 使用示例
 | `reachability_reachable_points.npy` | 可达点坐标 [M, 3] |
 | `reachability_dexterity.npy` | 每个点的灵活度 [N] |
 | `reachability_manipulability.npy` | 每个点的可操作度 [N] |
+| `reachability_best_solutions.npy` | 每个点的最优 IK 解 [N, n_joints] |
 | `reachability_data.csv` | CSV 格式的完整数据 |
 | `reachability_stats.json` | 统计信息（可达率、平均值等） |
 | `reachability_visualization.html` | 交互式 3D 可视化 |
@@ -191,7 +259,9 @@ w = sqrt(det(J * J^T))
 - 反映末端执行器在各方向上的运动能力均衡性
 
 - **取值范围**: 0 到 1（归一化后）
-- **可视化**: 点的大小（小 → 大 表示 低 → 高）
+- **可视化**:
+  - Plotly/Matplotlib：点的大小（小 → 大）
+  - RViz2：点的透明度（低 → 高）
 
 ### IK 解的数量
 

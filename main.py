@@ -252,6 +252,13 @@ def parse_args():
         help='RViz 固定坐标系（默认: world）'
     )
     parser.add_argument(
+        '--rviz-color-mode',
+        type=str,
+        choices=['dexterity', 'arm', 'tint'],
+        default='dexterity',
+        help='RViz 点云颜色模式（默认: dexterity）'
+    )
+    parser.add_argument(
         '--rviz-once',
         action='store_true',
         help='仅发布一次后退出（默认持续发布，需要手动 Ctrl+C 停止）'
@@ -427,7 +434,8 @@ def run_multi_arm_analysis(config: ReachabilityConfig, args) -> MultiArmReachabi
             # 创建多臂RViz发布器配置
             rviz_config = RVizPublisherConfig(
                 frame_id=args.rviz_frame,
-                base_topic=args.rviz_topic.rsplit('/', 1)[0] if '/' in args.rviz_topic else "/reachability"
+                base_topic=args.rviz_topic.rsplit('/', 1)[0] if '/' in args.rviz_topic else "/reachability",
+                color_mode=args.rviz_color_mode
             )
 
             for arm_name, arm_result in result.results.items():
@@ -463,7 +471,8 @@ def run_rviz_visualization(visualizer, args):
         visualizer.visualize_rviz(
             frame_id=args.rviz_frame,
             topic=args.rviz_topic,
-            keep_alive=not args.rviz_once
+            keep_alive=not args.rviz_once,
+            color_mode=args.rviz_color_mode
         )
     except ImportError as e:
         print(f"[错误] 未找到 ROS 2 依赖: {e}")
