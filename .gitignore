@@ -17,6 +17,9 @@ __pycache__/
 reachability_output/
 ik_reachability_out/
 results/
-
+01_URDF/
+robot_model/
+reachability_output_wheel/
+reachability_output_wheel_robot/
 # 忽略 Mac 系统文件 (如果你同事用 Mac)
 .DS_Store
