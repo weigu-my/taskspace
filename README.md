@@ -139,24 +139,6 @@ robot_model/urdf/               # 机器人 URDF 模型
 curobo/                         # cuRobo GPU IK 引擎（git submodule）
 ```
 
-### 不需要的文件（可安全删除）
-
-以下文件为开发调试过程中的临时产物，不影响程序运行：
-
-| 文件 | 说明 |
-|------|------|
-| `arm_reachability/urdf_parser.py.bak` | urdf_parser 旧版本备份 |
-| `COORDINATE_FRAME_FIX.md` | 坐标系修复过程文档（调试笔记） |
-| `RVIZ_DUAL_ARM_SETUP.md` | RViz 双臂配置过程文档（调试笔记） |
-| `wheel_robot.urdf` | 项目根目录的 URDF 副本（正式版本在 `robot_model/urdf/`） |
-| `wheel_robot_absolute.urdf` | 绝对路径版 URDF（调试用） |
-| `collision_spheres.yaml` | 碰撞球配置导出文件（运行时动态生成，无需保留） |
-| `frames_2026-01-29_11.31.06.gv` | TF 树 graphviz 源文件（调试用） |
-| `frames_2026-01-29_11.31.06.pdf` | TF 树 PDF（调试用） |
-| `dual_arm_reachability.rviz` | RViz 配置文件（可按需保留） |
-| `example.py` | 旧版使用示例（API 已变更，不再准确） |
-| `日志.ini` | 开发日志（个人笔记） |
-
 ## 核心流程
 
 ```
