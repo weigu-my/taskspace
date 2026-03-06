@@ -407,3 +407,54 @@ class ReachabilityConfig:
 
         with open(yaml_path, 'w', encoding='utf-8') as f:
             yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+
+
+@dataclass
+class DynamicReachabilityConfig:
+    """
+    动态可达性分析配置
+
+    用于在指定姿态下计算可达空间，考虑机器人其他部分（躯体、另一臂等）的碰撞。
+    """
+
+    # 是否启用环境碰撞检测（机器人躯体、底座、另一臂等）
+    environment_collision_check: bool = True
+
+    # 碰撞安全缓冲距离（米）
+    collision_buffer: float = 0.02
+
+    # 固定臂名称（计算另一个臂的可达空间时，此臂作为障碍物）
+    # 为空时表示不固定任何臂，仅考虑躯体等固定结构
+    fixed_arm: str = ""
+
+    # 固定臂的关节位置（为空时使用零位）
+    fixed_arm_joint_positions: List[float] = field(default_factory=list)
+
+    # 排除的link列表（不作为障碍物，如末端夹爪）
+    exclude_links: List[str] = field(default_factory=list)
+
+    # 是否自动重计算（当关节状态变化时）
+    auto_recalculate: bool = False
+
+    # 重计算防抖时间（秒）
+    recalculate_debounce: float = 1.0
+
+    # 使用简化碰撞模型（球体近似，更快但精度较低）
+    use_simplified_collision: bool = True
+
+    # 简化碰撞球体半径（米），仅当use_simplified_collision=True时使用
+    simplified_sphere_radius: float = 0.05
+
+    def copy(self) -> "DynamicReachabilityConfig":
+        """创建配置的副本"""
+        return DynamicReachabilityConfig(
+            environment_collision_check=self.environment_collision_check,
+            collision_buffer=self.collision_buffer,
+            fixed_arm=self.fixed_arm,
+            fixed_arm_joint_positions=self.fixed_arm_joint_positions.copy(),
+            exclude_links=self.exclude_links.copy(),
+            auto_recalculate=self.auto_recalculate,
+            recalculate_debounce=self.recalculate_debounce,
+            use_simplified_collision=self.use_simplified_collision,
+            simplified_sphere_radius=self.simplified_sphere_radius
+        )

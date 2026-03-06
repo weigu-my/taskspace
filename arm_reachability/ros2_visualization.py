@@ -71,6 +71,12 @@ class RVizPublisherConfig:
     # 是否在 base_transform 中应用旋转（False 表示仅平移）
     use_base_transform_rotation: bool = True
 
+    # 是否订阅外部 JointState 消息（用于动态姿态控制）
+    subscribe_joint_states: bool = False
+
+    # JointState 订阅 Topic
+    joint_states_topic: str = "/joint_states"
+
 
 class RVizReachabilityPublisher:
     """
@@ -94,6 +100,12 @@ class RVizReachabilityPublisher:
         self._tf_broadcaster = None
         self._robot_configs = {}  # {arm_name: RobotConfig}
         self._last_world_transforms = {}  # {arm_name: {link_name: 4x4}}
+
+        # JointState 订阅相关
+        self._joint_state_subscriber = None
+        self._arm_joint_states = {}  # {arm_name: {joint_name: position}}
+        self._arm_joint_names = {}  # {arm_name: [joint_names]} 缓存各臂关节名
+        self._joint_state_callbacks = []  # 外部回调列表
 
     def _ensure_ros_init(self):
         """确保 ROS 2 已初始化"""
@@ -180,6 +192,24 @@ class RVizReachabilityPublisher:
                     JointState, js_topic, 10
                 )
 
+        # JointState 订阅器（用于接收外部姿态控制，如 joint_state_publisher_gui）
+        if self.config.subscribe_joint_states:
+            self._joint_state_subscriber = self._node.create_subscription(
+                JointState,
+                self.config.joint_states_topic,
+                self._on_joint_state_received,
+                10
+            )
+            self._node.get_logger().info(
+                f'已订阅 JointState: {self.config.joint_states_topic}'
+            )
+            # 初始化各臂关节名缓存
+            for arm in self.config.arms:
+                joint_names = self._get_joint_names_from_urdf(arm.urdf_path)
+                if joint_names:
+                    self._arm_joint_names[arm.name] = joint_names
+                    self._arm_joint_states[arm.name] = {n: 0.0 for n in joint_names}
+
         self._ros_initialized = True
         self._node.get_logger().info(
             f'RViz 可达性发布器已初始化，臂数量: {len(self.config.arms)}'
@@ -198,7 +228,80 @@ class RVizReachabilityPublisher:
             return robot_config
         except Exception as e:
             self._node.get_logger().warn(f"解析 URDF 失败（无法发布 TF）: {e}")
+
+    def _on_joint_state_received(self, msg) -> None:
+        """
+        处理接收到的 JointState 消息
+
+        将关节位置按臂名分类存储，更新 TF 使点云跟随机器人姿态变化，
+        并触发外部回调。
+        """
+        # 解析消息中的关节位置
+        received_joints = dict(zip(msg.name, msg.position))
+
+        # 按臂分类更新关节状态
+        changed_arms = []
+        for arm_name, arm_joints in self._arm_joint_names.items():
+            updated = False
+            for joint_name in arm_joints:
+                if joint_name in received_joints:
+                    new_pos = received_joints[joint_name]
+                    old_pos = self._arm_joint_states[arm_name].get(joint_name, 0.0)
+                    if abs(new_pos - old_pos) > 1e-6:
+                        self._arm_joint_states[arm_name][joint_name] = new_pos
+                        updated = True
+            if updated:
+                changed_arms.append(arm_name)
+
+        # 当关节状态变化时，更新 TF 使机器人模型和点云跟随姿态变化
+        if changed_arms and self.config.publish_tf:
+            for arm in self.config.arms:
+                if arm.name in changed_arms:
+                    joint_positions = self.get_arm_joint_positions(arm.name)
+                    if joint_positions is not None:
+                        self.publish_tf(arm, joint_positions=joint_positions)
+
+        # 触发外部回调
+        if changed_arms:
+            for callback in self._joint_state_callbacks:
+                try:
+                    callback(changed_arms, self._arm_joint_states)
+                except Exception as e:
+                    self._node.get_logger().warn(f"JointState 回调执行失败: {e}")
+
+    def register_joint_state_callback(self, callback) -> None:
+        """
+        注册 JointState 变化回调
+
+        回调函数签名: callback(changed_arms: List[str], all_states: Dict[str, Dict[str, float]])
+        - changed_arms: 本次变化的臂名列表
+        - all_states: 所有臂的当前关节状态 {arm_name: {joint_name: position}}
+        """
+        if callback not in self._joint_state_callbacks:
+            self._joint_state_callbacks.append(callback)
+
+    def unregister_joint_state_callback(self, callback) -> None:
+        """取消注册 JointState 变化回调"""
+        if callback in self._joint_state_callbacks:
+            self._joint_state_callbacks.remove(callback)
+
+    def get_arm_joint_positions(self, arm_name: str) -> Optional[List[float]]:
+        """
+        获取指定臂的当前关节位置列表
+
+        返回:
+            关节位置列表（按URDF中的顺序），如果臂不存在则返回None
+        """
+        if arm_name not in self._arm_joint_states:
             return None
+        if arm_name not in self._arm_joint_names:
+            return None
+        joint_names = self._arm_joint_names[arm_name]
+        return [self._arm_joint_states[arm_name].get(n, 0.0) for n in joint_names]
+
+    def get_all_joint_states(self) -> dict:
+        """获取所有臂的当前关节状态"""
+        return self._arm_joint_states.copy()
 
     def _rpy_to_matrix(self, roll: float, pitch: float, yaw: float) -> np.ndarray:
         cr, sr = math.cos(roll), math.sin(roll)
@@ -706,12 +809,42 @@ class RVizReachabilityPublisher:
         base_transform = getattr(result, 'base_transform', None)
 
         # 确定 frame_id 和变换策略
-        if base_link:
-            # 正常情况：使用 base_link 作为 frame_id，依赖 TF 变换
+        if base_link and points_frame != 'world':
+            # 点云已在 base_link 坐标系中：直接使用 base_link 作为 frame_id
             frame_id = base_link
             transform = None
             self._node.get_logger().info(
                 f'{arm.name} 臂: 点云使用 frame_id={frame_id}（依赖 TF 变换到 world）'
+            )
+        elif base_link and points_frame == 'world' and base_transform is not None:
+            # 点云在 world 坐标系中，但需要发布在 base_link 帧以便跟随机器人姿态
+            # 计算逆变换：world -> base_link
+            frame_id = base_link
+            T_world_base = self._base_transform_to_matrix(
+                base_transform,
+                self.config.use_base_transform_rotation
+            )
+            if T_world_base is not None:
+                # 逆变换: T_base_world = inv(T_world_base)
+                R_inv = T_world_base[:3, :3].T
+                t_inv = -R_inv @ T_world_base[:3, 3]
+                transform = np.eye(4, dtype=np.float64)
+                transform[:3, :3] = R_inv
+                transform[:3, 3] = t_inv
+                self._node.get_logger().info(
+                    f'{arm.name} 臂: 点云从 world 逆变换到 frame_id={frame_id}（跟随 TF 变化）'
+                )
+            else:
+                transform = None
+                self._node.get_logger().warn(
+                    f'{arm.name} 臂: 逆变换失败，点云在 base_link 帧中可能位置不正确'
+                )
+        elif base_link and points_frame == 'world':
+            # 点云在 world 坐标系且无 base_transform，直接使用 world 帧
+            frame_id = self.config.frame_id
+            transform = None
+            self._node.get_logger().info(
+                f'{arm.name} 臂: 点云在 world 坐标系，使用 frame_id={frame_id}'
             )
         elif base_transform is not None:
             # Fallback: base_link 为空但有 base_transform，手动变换到 world
@@ -733,6 +866,8 @@ class RVizReachabilityPublisher:
             )
 
         msg = self._create_pointcloud2(result, transform=transform, frame_id=frame_id)
+        if msg is None:
+            return
         self._publishers[arm.name].publish(msg)
         self._node.get_logger().info(f'发布 {arm.name} 臂 PointCloud2: {result.reachable_count} 个点 (frame: {frame_id})')
 
@@ -751,13 +886,16 @@ class RVizReachabilityPublisher:
         dexterity = result.dexterity[mask]
         manipulability = result.manipulability[mask]
 
+        if len(points) == 0:
+            self._node.get_logger().warn('可达点数为 0，跳过点云发布')
+            return None
+
         # 应用完整变换：旋转 + 平移
         if transform is not None:
             R = transform[:3, :3]
             t = transform[:3, 3]
             # p_world = R @ p_arm + t
             points = (R @ points.T).T + t
-            # 调试日志
             self._node.get_logger().info(
                 f'变换后坐标范围: X[{points[:,0].min():.2f},{points[:,0].max():.2f}] '
                 f'Y[{points[:,1].min():.2f},{points[:,1].max():.2f}] '
@@ -858,13 +996,15 @@ class RVizReachabilityPublisher:
             # 发布机器人描述
             self.publish_robot_description(arm)
 
-            # 发布关节状态
-            self.publish_joint_states(arm)
-            if arm.name in self._joint_state_publishers:
-                # 与 publish_joint_states 默认一致（全 0），用于 TF
-                joint_positions = None
-            else:
-                joint_positions = None
+            # 获取关节位置：优先使用从 joint_state_publisher_gui 订阅到的值
+            joint_positions = None
+            if self.config.subscribe_joint_states:
+                joint_positions = self.get_arm_joint_positions(arm.name)
+
+            # 发布关节状态（当未使用外部 robot_state_publisher 时）
+            if not self.config.subscribe_joint_states:
+                self.publish_joint_states(arm, joint_positions)
+
             self.publish_tf(arm, joint_positions=joint_positions)
 
             # 加载并发布点云

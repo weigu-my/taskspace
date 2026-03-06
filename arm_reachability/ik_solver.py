@@ -51,7 +51,8 @@ class MultiSeedIKSolver:
         self,
         robot_config: RobotConfig,
         ik_config: IKConfig,
-        device: str = "cuda:0"
+        device: str = "cuda:0",
+        world_config: Optional[Any] = None
     ):
         """
         初始化多种子IK求解器
@@ -60,13 +61,17 @@ class MultiSeedIKSolver:
             robot_config: 从URDF解析器获取的机器人配置
             ik_config: IK求解器配置
             device: 计算设备
+            world_config: cuRobo WorldConfig对象，用于环境碰撞检测
+                         可以包含机器人躯体、另一臂等障碍物
         """
         self.robot_config = robot_config
         self.ik_config = ik_config
         self.device = device
+        self.world_config = world_config  # 环境碰撞配置
         self.ik_solver = None
         self.tensor_args = None
         self._current_batch_size = None  # 跟踪当前批次大小
+        self._robot_cfg = None  # 缓存cuRobo机器人配置
 
         # 用于坐标变换的 Pinocchio 模型
         self.pin_model = None
@@ -94,22 +99,44 @@ class MultiSeedIKSolver:
             config_generator = CuroboConfigGenerator(self.robot_config)
             curobo_config = config_generator.generate()
 
+            # 尝试从 mesh 生成碰撞球（更精确），否则回退到简单球
+            if self.ik_config.self_collision_check:
+                mesh_collision = self._generate_mesh_collision_spheres()
+                if mesh_collision:
+                    # 用 mesh 碰撞球替换简单碰撞球
+                    if 'robot_cfg' not in curobo_config:
+                        curobo_config['robot_cfg'] = {}
+                    curobo_config['robot_cfg']['collision'] = mesh_collision
+
             # 为cuRobo创建机器人配置
             robot_cfg = self._create_curobo_robot_config(curobo_config)
+            self._robot_cfg = robot_cfg  # 缓存配置用于后续更新
+
+            # 构建环境碰撞模型（包含躯干/底盘等非链 link 的碰撞球）
+            world_model = self.world_config
+            if (self.ik_config.self_collision_check
+                    and hasattr(self, '_body_collision_spheres')
+                    and self._body_collision_spheres):
+                world_model = self._build_body_world_config(world_model)
 
             # 创建IK求解器配置
-            # 注意: 禁用CUDA graph以避免批次大小变化时的错误
-            # CUDA graph 要求批次大小固定，但最后一个批次可能较小
+            # 当有环境碰撞球时使用 PRIMITIVE 碰撞检查器
+            from curobo.geom.sdf.world import CollisionCheckerType
+            checker_type = None  # 默认让 cuRobo 选择
+            if world_model is not None:
+                checker_type = CollisionCheckerType.PRIMITIVE
+
             ik_solver_config = IKSolverConfig.load_from_robot_config(
                 robot_cfg=robot_cfg,
-                world_model=None,
+                world_model=world_model,
                 tensor_args=self.tensor_args,
                 num_seeds=self.ik_config.num_seeds,
                 position_threshold=self.ik_config.position_threshold,
                 rotation_threshold=self.ik_config.rotation_threshold,
-                use_cuda_graph=False,  # 禁用CUDA graph以支持可变批次大小
+                use_cuda_graph=False,
                 self_collision_check=self.ik_config.self_collision_check,
                 self_collision_opt=self.ik_config.self_collision_check,
+                collision_checker_type=checker_type,
             )
 
             self.ik_solver = IKSolver(ik_solver_config)
@@ -118,28 +145,38 @@ class MultiSeedIKSolver:
             print(f"[IK求解器] 已初始化，种子数: {self.ik_config.num_seeds}")
             print(f"[IK求解器] 机器人: {self.robot_config.name}, 自由度: {self.n_joints}")
             print(f"[IK求解器] 设备: {self.device}")
+            print(f"[IK求解器] 自碰撞检测: {'启用' if self.ik_config.self_collision_check else '禁用'}")
+            has_world = world_model is not None
+            print(f"[IK求解器] 环境碰撞检测: {'启用' if has_world else '禁用'}")
 
         except ImportError as e:
             print(f"[警告] cuRobo不可用: {e}")
             print("[警告] 使用模拟求解器")
             self._initialize_dummy_solver()
 
+    def update_world_config(self, world_config: Optional[Any]) -> None:
+        """
+        动态更新环境碰撞配置
+
+        这会重新创建IK求解器以应用新的碰撞配置。
+        用于在固定臂姿态变化后更新碰撞障碍物。
+
+        参数:
+            world_config: 新的cuRobo WorldConfig对象
+        """
+        self.world_config = world_config
+        if self.ik_solver is not None:
+            # 重新初始化求解器以应用新的world_config
+            self._initialize_solver()
+            print(f"[IK求解器] 已更新环境碰撞配置")
+
     def _create_curobo_robot_config(self, config_dict: Dict) -> Any:
-        """从字典创建cuRobo机器人配置"""
+        """从字典创建cuRobo机器人配置（含碰撞球用于自碰撞检测）"""
         from curobo.types.robot import RobotConfig as CuroboRobotConfig
 
         # 获取活动关节
         active_joints = self.robot_config.active_joints
         joint_names = [j.name for j in active_joints]
-
-        # 构建关节限位
-        joint_limits = {
-            'position': [
-                [j.lower_limit for j in active_joints],
-                [j.upper_limit for j in active_joints]
-            ],
-            'velocity': [[j.velocity_limit for j in active_joints]],
-        }
 
         # 创建配置字典
         robot_cfg_dict = {
@@ -157,12 +194,253 @@ class MultiSeedIKSolver:
             },
         }
 
+        # 从 CuroboConfigGenerator 生成的配置中提取碰撞球数据
+        # 碰撞球必须放入 kinematics 字典中（CudaRobotGeneratorConfig 的字段）
+        # 而不是作为 RobotConfig 的顶层 key
+        collision_data = None
+        if 'robot_cfg' in config_dict and 'collision' in config_dict['robot_cfg']:
+            collision_data = config_dict['robot_cfg']['collision']
+        elif 'collision' in config_dict:
+            collision_data = config_dict['collision']
+
+        if collision_data:
+            kin = robot_cfg_dict['kinematics']
+            if 'collision_spheres' in collision_data:
+                kin['collision_spheres'] = collision_data['collision_spheres']
+                # 碰撞 link 名称列表
+                kin['collision_link_names'] = list(collision_data['collision_spheres'].keys())
+            # self_collision_buffer 和 self_collision_ignore 必须为 dict（不能为 None）
+            # 否则 cuRobo 内部调用 .copy() / .keys() 会报 AttributeError
+            kin['self_collision_buffer'] = collision_data.get('self_collision_buffer', {}) or {}
+            kin['self_collision_ignore'] = collision_data.get('self_collision_ignore', {}) or {}
+            if 'collision_sphere_buffer' in collision_data:
+                kin['collision_sphere_buffer'] = collision_data['collision_sphere_buffer']
+            print(f"[IK求解器] 已加载碰撞球配置（{len(kin.get('collision_link_names', []))} 个链接），用于自碰撞检测")
+        else:
+            print(f"[IK求解器] 警告: 未找到碰撞球配置，自碰撞检测可能不生效")
+
         robot_cfg = CuroboRobotConfig.from_dict(
             robot_cfg_dict,
             self.tensor_args
         )
 
         return robot_cfg
+
+    def _generate_mesh_collision_spheres(self) -> Optional[Dict]:
+        """
+        从 URDF mesh 文件生成碰撞球配置
+
+        只为 arm chain 上的 link 生成碰撞球（用于 cuRobo 自碰撞检测）。
+        非 chain link（躯干/底盘等）的碰撞球作为环境障碍物处理。
+        """
+        try:
+            from arm_reachability.collision_spheres_generator import (
+                generate_collision_spheres_yaml
+            )
+            # 获取运动链上的 link 名称
+            chain_links = set(self.robot_config.chain_links) if self.robot_config.chain_links else set()
+            if not chain_links:
+                chain_links = {self.robot_config.base_link, self.robot_config.ee_link}
+
+            # 排除以下 link 出环境碰撞:
+            # 1) chain link 的所有子孙（夹爪等，随臂运动）
+            # 2) chain base 的直接父/祖父 link（如 Trunk_Link4，会与臂基座碰撞球重叠）
+            child_map = {}
+            parent_map = {}  # child -> parent
+            for j in self.robot_config.joints:
+                child_map.setdefault(j.parent_link, []).append(j.child_link)
+                parent_map[j.child_link] = j.parent_link
+
+            # BFS 找 chain 中所有 link 的后代
+            moving_links = set(chain_links)
+            stack = list(chain_links)
+            while stack:
+                current = stack.pop()
+                for child in child_map.get(current, []):
+                    if child not in moving_links:
+                        moving_links.add(child)
+                        stack.append(child)
+
+            # 沿 fixed joint 向上追溯，排除与臂基座刚性连接的 link
+            # （它们和臂基座永远相对静止，碰撞球会重叠）
+            current_link = self.robot_config.base_link
+            while True:
+                parent = parent_map.get(current_link)
+                if not parent:
+                    break
+                # 找连接 current_link 的 joint
+                joint_type = None
+                for j in self.robot_config.joints:
+                    if j.child_link == current_link:
+                        joint_type = j.type
+                        break
+                if joint_type == 'fixed':
+                    moving_links.add(parent)
+                    current_link = parent
+                else:
+                    break  # 遇到非 fixed joint 就停止
+
+            print(f"[IK求解器] 从 URDF mesh 生成碰撞球（chain links: {len(chain_links)}，运动 links: {len(moving_links)}）...")
+
+            # 只为 chain links 生成碰撞球（用于自碰撞检测）
+            config = generate_collision_spheres_yaml(
+                urdf_path=self.robot_config.urdf_path,
+                output_path=None,
+                max_spheres_per_link=8,
+                include_links=list(chain_links),
+            )
+
+            # 为非运动 links 生成环境碰撞障碍物
+            # 排除所有随机械臂运动的 link（chain links + 其子孙如夹爪）
+            body_config = generate_collision_spheres_yaml(
+                urdf_path=self.robot_config.urdf_path,
+                output_path=None,
+                max_spheres_per_link=6,
+                exclude_links=list(moving_links),
+            )
+
+            if body_config and body_config.get('collision_spheres'):
+                self._body_collision_spheres = body_config['collision_spheres']
+                print(f"[IK求解器] 非链接 link 碰撞球: {len(self._body_collision_spheres)} 个 link（作为环境障碍物）")
+            else:
+                self._body_collision_spheres = {}
+
+            return config
+        except Exception as e:
+            print(f"[IK求解器] mesh 碰撞球生成失败: {e}，回退到简单碰撞球")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def _build_body_world_config(self, existing_world_config=None):
+        """
+        将非链 link 的碰撞球转换为 cuRobo 环境碰撞障碍物。
+
+        躯干/底盘等不在运动链上的 link 不能用 cuRobo 自碰撞检测，
+        但可以作为环境中的球形障碍物。这些球的位置是在 base_link 坐标系中
+        通过零位 FK 计算得到的。
+        """
+        if not self._body_collision_spheres:
+            return existing_world_config
+
+        import pinocchio as pin
+
+        # 用 pinocchio 计算零位时各 link 相对于 base_link 的位置
+        model = pin.buildModelFromUrdf(self.robot_config.urdf_path)
+        data = model.createData()
+        q0 = pin.neutral(model)
+        pin.forwardKinematics(model, data, q0)
+        pin.updateFramePlacements(model, data)
+
+        # 找 base_link frame
+        base_frame_id = None
+        for i, f in enumerate(model.frames):
+            if f.name == self.robot_config.base_link:
+                base_frame_id = i
+                break
+
+        if base_frame_id is None:
+            print(f"[IK求解器] 无法找到 base_link '{self.robot_config.base_link}' 的 frame，跳过环境碰撞")
+            return existing_world_config
+
+        # 构建 link_name -> frame_id 映射
+        frame_map = {}
+        for i, f in enumerate(model.frames):
+            frame_map[f.name] = i
+
+        sphere_obstacles = []
+        for link_name, spheres in self._body_collision_spheres.items():
+            if link_name not in frame_map:
+                continue
+            frame_id = frame_map[link_name]
+            # link 在 base_link 坐标系中的位姿
+            link_in_base = data.oMf[base_frame_id].actInv(data.oMf[frame_id])
+            R = link_in_base.rotation
+            t = link_in_base.translation
+
+            for sphere in spheres:
+                # 将球的中心从 link 坐标系转到 base_link 坐标系
+                center_local = np.array(sphere['center'])
+                center_base = R @ center_local + t
+                sphere_obstacles.append({
+                    "name": f"body_{link_name}_{len(sphere_obstacles)}",
+                    "pose": [
+                        float(center_base[0]),
+                        float(center_base[1]),
+                        float(center_base[2]),
+                        1.0, 0.0, 0.0, 0.0  # quaternion (w,x,y,z)
+                    ],
+                    "radius": float(sphere['radius']),
+                })
+
+        if not sphere_obstacles:
+            return existing_world_config
+
+        # 保存排除区域：用于在 IK 求解前过滤掉落入机器人身体内的目标点
+        # cuRobo 的碰撞检测只检查臂链碰撞球与环境的碰撞，
+        # 不会检查目标点(ee)本身是否在障碍物内部
+        centers = np.array([s["pose"][:3] for s in sphere_obstacles])
+        radii = np.array([s["radius"] for s in sphere_obstacles])
+        self._body_exclusion_centers = centers  # [N, 3] base_link 坐标系
+        self._body_exclusion_radii = radii      # [N]
+        print(f"[IK求解器] 身体排除区域: {len(sphere_obstacles)} 个球体")
+
+        print(f"[IK求解器] 环境碰撞: {len(sphere_obstacles)} 个碰撞体（来自躯干/底盘 link）")
+
+        # cuRobo 的 PRIMITIVE 碰撞检测器只支持 cuboid (OBB)
+        # 将球形障碍物转换为立方体: dims = [2r, 2r, 2r]
+        cuboid_dict = {}
+        for s in sphere_obstacles:
+            r = s["radius"]
+            side = 2.0 * r
+            cuboid_dict[s["name"]] = {
+                "pose": s["pose"],
+                "dims": [side, side, side],
+            }
+
+        world_dict = {"cuboid": cuboid_dict}
+        if existing_world_config is not None:
+            if isinstance(existing_world_config, dict):
+                for k, v in existing_world_config.items():
+                    if k in world_dict:
+                        world_dict[k].update(v) if isinstance(v, dict) else None
+                    else:
+                        world_dict[k] = v
+            return world_dict
+
+        return world_dict
+
+    def _check_body_exclusion(self, positions_base: np.ndarray) -> np.ndarray:
+        """
+        检查目标点是否在机器人身体排除区域内。
+
+        cuRobo 的碰撞检测只检查臂链 link 碰撞球与环境障碍物的碰撞，
+        不会检查目标点(ee/tcp)本身是否在障碍物内部。
+        因此需要额外的几何过滤来排除落入躯干/底盘内的目标点。
+
+        参数:
+            positions_base: 目标点在 base_link 坐标系中的位置 [N, 3]
+
+        返回:
+            excluded_mask: [N] 布尔数组，True 表示该点在身体内部（应排除）
+        """
+        if not hasattr(self, '_body_exclusion_centers') or self._body_exclusion_centers is None:
+            return np.zeros(len(positions_base), dtype=bool)
+
+        centers = self._body_exclusion_centers  # [M, 3]
+        radii = self._body_exclusion_radii      # [M]
+
+        # 计算每个目标点到每个排除球心的距离
+        # positions_base: [N, 3], centers: [M, 3]
+        # diff: [N, M, 3]
+        diff = positions_base[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dists = np.linalg.norm(diff, axis=2)  # [N, M]
+
+        # 如果目标点到任一球心的距离 < 球半径，则该点在身体内部
+        inside = dists < radii[np.newaxis, :]  # [N, M]
+        excluded = np.any(inside, axis=1)  # [N]
+
+        return excluded
 
     def _initialize_dummy_solver(self):
         """初始化模拟求解器用于测试（无需cuRobo）"""
@@ -423,16 +701,17 @@ class MultiSeedIKSolver:
 
         from curobo.types.math import Pose
 
-        # 如果位置已经是 world 坐标系，直接使用；否则从 base_link 转换
+        # cuRobo IK solver 工作在 base_link 坐标系中
+        # 如果输入是 world 坐标系，需要逆变换到 base_link；否则直接使用
         if positions_in_world:
-            world_positions = positions
+            base_positions = self._transform_to_base_frame(positions)
         else:
-            world_positions = self._transform_to_world_frame(positions)
+            base_positions = positions
 
         # 创建目标位姿
         goal_pose = Pose(
             position=torch.tensor(
-                world_positions,
+                np.ascontiguousarray(base_positions),
                 dtype=torch.float32,
                 device=self.device
             ),
@@ -443,12 +722,34 @@ class MultiSeedIKSolver:
             )
         )
 
+        # 身体排除过滤：排除落入机器人身体内的目标点
+        body_excluded = self._check_body_exclusion(base_positions)
+        n_excluded = int(np.sum(body_excluded))
+
+        # 对于不在身体内的点，正常求解 IK
+        # 对于在身体内的点，直接标记为不可达
+        if n_excluded == batch_size:
+            # 所有点都在身体内，直接返回全部不可达
+            solve_time = time.time() - start_time
+            return BatchIKResult(
+                success_mask=np.zeros(batch_size, dtype=bool),
+                num_solutions=np.zeros(batch_size, dtype=np.int32),
+                best_solutions=np.zeros((batch_size, len(self.robot_config.active_joints)), dtype=np.float32),
+                all_solutions=np.zeros((batch_size, self.ik_config.num_seeds, len(self.robot_config.active_joints)), dtype=np.float32) if return_all_solutions else None,
+                solution_masks=np.zeros((batch_size, self.ik_config.num_seeds), dtype=bool),
+                solve_time=solve_time
+            )
+
         # 批量求解IK
         result = self.ik_solver.solve_batch(goal_pose)
 
         # 提取结果
         success_mask = result.success.cpu().numpy()
         solutions = result.solution.cpu().numpy()  # [batch_size, num_seeds, n_joints]
+
+        # 将身体内的点标记为不可达
+        if n_excluded > 0:
+            success_mask[body_excluded] = False
 
         # 每个位姿的最优解（取第一个成功的种子）
         best_solutions = solutions[:, 0, :]  # 取第一个种子作为最优解
@@ -465,6 +766,8 @@ class MultiSeedIKSolver:
             rotation_errors = result.rotation_error.cpu().numpy() if hasattr(result, 'rotation_error') else np.zeros_like(position_errors)
 
             for i in range(batch_size):
+                if body_excluded[i]:
+                    continue  # 身体内的点已标记不可达
                 valid = (
                     (position_errors[i] < self.ik_config.position_threshold) &
                     (rotation_errors[i] < self.ik_config.rotation_threshold)
@@ -566,6 +869,16 @@ class MultiSeedIKSolver:
         print(f"[IK求解器] 测试 {n_positions} 个位置 × {n_orientations} 个姿态")
         print(f"[IK求解器] 总位姿数: {n_positions * n_orientations}")
 
+        # 预检查：统计有多少位置在身体排除区域内
+        if hasattr(self, '_body_exclusion_centers') and self._body_exclusion_centers is not None:
+            if positions_in_world:
+                check_positions = self._transform_to_base_frame(positions)
+            else:
+                check_positions = positions
+            excluded = self._check_body_exclusion(check_positions)
+            n_excluded = int(np.sum(excluded))
+            print(f"[IK求解器] 身体排除过滤: {n_excluded} / {n_positions} 个位置在机器人身体内（将被排除）")
+
         # 创建所有位置-姿态组合
         # positions: [n_positions, 3] -> [n_positions, n_orientations, 3]
         # orientations: [n_orientations, 4] -> [n_positions, n_orientations, 4]
@@ -656,6 +969,33 @@ class MultiSeedIKSolver:
 
         return base_positions
 
+    def _transform_to_base_frame(self, world_positions: np.ndarray) -> np.ndarray:
+        """
+        将世界坐标系中的位置转换为 base_link 坐标系
+
+        参数:
+            world_positions: 世界坐标系中的位置 [batch_size, 3] 或 [3]
+
+        返回:
+            base_positions: base_link 坐标系中的位置 [batch_size, 3] 或 [3]
+        """
+        if self._base_transform is None:
+            return world_positions
+
+        base_translation = self._base_transform['translation']
+        base_rotation = self._base_transform['rotation']
+
+        # p_base = R^T * (p_world - t_base)
+        R_inv = base_rotation.T
+        if world_positions.ndim == 1:
+            base_positions = R_inv @ (world_positions - base_translation)
+        else:
+            shifted = world_positions - base_translation[np.newaxis, :]
+            base_positions = np.einsum('ij,nj->ni', R_inv, shifted)
+            base_positions = np.ascontiguousarray(base_positions)
+
+        return base_positions
+
     def _transform_to_world_frame(self, base_positions: np.ndarray) -> np.ndarray:
         """
         将 base_link 坐标系中的位置转换为世界坐标系
@@ -717,11 +1057,9 @@ class MultiSeedIKSolver:
 
         state = self.ik_solver.fk(q)
 
-        world_positions = state.ee_position.cpu().numpy()
+        # cuRobo FK 输出已经在 base_link 坐标系中
+        positions = state.ee_position.cpu().numpy()
         orientations = state.ee_quaternion.cpu().numpy()  # (w, x, y, z)
-
-        # 转换到 base_link 坐标系
-        positions = self._transform_to_base_frame(world_positions)
 
         return positions, orientations
 
@@ -860,10 +1198,13 @@ class MultiSeedIKSolver:
                 n_samples
             )
 
-        # 计算 FK，直接获取 world 坐标系的位置（不转换到 base_link）
+        # 计算 FK（cuRobo FK 输出在 base_link 坐标系中）
         q = torch.tensor(joint_configs, dtype=torch.float32, device=self.device)
         state = self.ik_solver.fk(q)
-        world_positions = state.ee_position.cpu().numpy()  # world 坐标系
+        base_positions = state.ee_position.cpu().numpy()  # base_link 坐标系
+
+        # 转换到 world 坐标系
+        world_positions = self._transform_to_world_frame(base_positions)
 
         # 计算 world 坐标系下的边界
         x_min, y_min, z_min = world_positions.min(axis=0)

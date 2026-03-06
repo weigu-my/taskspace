@@ -145,16 +145,33 @@ class ReachabilityAnalyzer:
     5. 计算可操作度（Yoshikawa指标）
     """
 
-    def __init__(self, config: ReachabilityConfig, robot_config: RobotConfig = None):
+    def __init__(
+        self,
+        config: ReachabilityConfig = None,
+        robot_config: RobotConfig = None,
+        world_config: Optional[Any] = None,
+        urdf_path: str = None
+    ):
         """
         初始化可达性分析器
 
         参数:
             config: 可达性分析配置
             robot_config: 可选的预解析机器人配置（用于多臂分析）
+            world_config: cuRobo WorldConfig对象，用于环境碰撞检测
+                         可以包含机器人躯体、另一臂等障碍物
+            urdf_path: URDF文件路径（如果config未提供）
         """
+        # 支持仅传入urdf_path的简化用法
+        if config is None:
+            from .config import ReachabilityConfig
+            config = ReachabilityConfig()
+            if urdf_path:
+                config.urdf_path = urdf_path
+
         self.config = config
         self.robot_config: Optional[RobotConfig] = robot_config
+        self.world_config = world_config  # 环境碰撞配置
         self.ik_solver: Optional[MultiSeedIKSolver] = None
         self.manipulability_calc: Optional[ManipulabilityCalculator] = None
 
@@ -188,7 +205,8 @@ class ReachabilityAnalyzer:
         self.ik_solver = MultiSeedIKSolver(
             robot_config=self.robot_config,
             ik_config=self.config.ik,
-            device=self.config.device
+            device=self.config.device,
+            world_config=self.world_config
         )
 
         # 初始化可操作度计算器

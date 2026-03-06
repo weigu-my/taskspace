@@ -37,6 +37,7 @@ KILL_RVIZ=false
 POINTS_FRAME="world"
 TRANSLATION_ONLY=false
 PUBLISH_TF=false
+JOINT_STATE_GUI=false
 CLEAN_ROS=false
 KILL_RVIZ=false
 OUTPUT_DIR=""
@@ -91,6 +92,7 @@ show_help() {
     echo "  --config PATH       YAML 配置文件路径"
     echo "  --translation-only  发布时仅平移，不应用 base_transform 旋转"
     echo "  --publish-tf        使用点云发布器发布 TF（将不启动 robot_state_publisher）"
+    echo "  --joint-state-gui   启动 joint_state_publisher_gui（可通过滑条调整关节，点云跟随变化）"
     echo "  --rviz-color-mode M RViz 颜色模式: dexterity/arm/tint (默认: dexterity)"
     echo "  --rviz-frame F      RViz Fixed Frame (默认: world)"
     echo "  --rviz-topic T      RViz 点云 Topic (如 /reachability/points)"
@@ -143,6 +145,7 @@ while [[ $# -gt 0 ]]; do
         --config) CONFIG_PATH="$2"; shift 2 ;;
         --translation-only) TRANSLATION_ONLY=true; shift ;;
         --publish-tf) PUBLISH_TF=true; shift ;;
+        --joint-state-gui) JOINT_STATE_GUI=true; shift ;;
         --rviz-color-mode|--color-mode) RVIZ_COLOR_MODE="$2"; shift 2 ;;
         --rviz-frame) RVIZ_FRAME="$2"; shift 2 ;;
         --rviz-topic) RVIZ_TOPIC="$2"; shift 2 ;;
@@ -374,10 +377,16 @@ PYEOF
         > /tmp/rsp.log 2>&1 &
     RSP_PID=$!
 
-    # 启动 joint_state_publisher (后台运行)
-    print_info "启动 joint_state_publisher..."
-    ros2 run joint_state_publisher joint_state_publisher \
-        > /tmp/jsp.log 2>&1 &
+    # 启动 joint_state_publisher 或 joint_state_publisher_gui
+    if [ "$JOINT_STATE_GUI" = true ]; then
+        print_info "启动 joint_state_publisher_gui（可通过滑条调整关节姿态）..."
+        ros2 run joint_state_publisher_gui joint_state_publisher_gui \
+            > /tmp/jsp.log 2>&1 &
+    else
+        print_info "启动 joint_state_publisher..."
+        ros2 run joint_state_publisher joint_state_publisher \
+            > /tmp/jsp.log 2>&1 &
+    fi
     JSP_PID=$!
 
     sleep 3
@@ -398,6 +407,13 @@ fi
 
 # Step 5: 启动点云发布节点
 print_info "步骤 4: 启动点云发布节点..."
+
+# 公共标志
+JOINT_STATE_FLAG=""
+if [ "$JOINT_STATE_GUI" = true ]; then
+    JOINT_STATE_FLAG="--subscribe-joint-states"
+    print_info "点云将订阅 /joint_states，跟随 joint_state_publisher_gui 姿态变化"
+fi
 
 cd "$SCRIPT_DIR"
 
@@ -432,8 +448,7 @@ if [ "$ARM_MODE" = "both" ] || [ "$ARM_MODE" = "all" ]; then
         --topic "$RVIZ_BASE_TOPIC" \
         --rate "$RVIZ_RATE" \
         --color-mode "$RVIZ_COLOR_MODE" \
-        $TRANSFORM_FLAG $TF_FLAG \
-        
+        $TRANSFORM_FLAG $TF_FLAG $JOINT_STATE_FLAG \
         > /tmp/rviz_pub.log 2>&1 &
     PUB_PID=$!
 
@@ -471,8 +486,7 @@ elif [ "$ARM_MODE" = "left" ]; then
         --topic "$RVIZ_BASE_TOPIC" \
         --rate "$RVIZ_RATE" \
         --color-mode "$RVIZ_COLOR_MODE" \
-        $TRANSFORM_FLAG $TF_FLAG \
-        
+        $TRANSFORM_FLAG $TF_FLAG $JOINT_STATE_FLAG \
         > /tmp/rviz_pub.log 2>&1 &
     PUB_PID=$!
 
@@ -505,7 +519,7 @@ elif [ "$ARM_MODE" = "right" ]; then
         --topic "$RVIZ_BASE_TOPIC" \
         --rate "$RVIZ_RATE" \
         --color-mode "$RVIZ_COLOR_MODE" \
-        $TRANSFORM_FLAG $TF_FLAG \
+        $TRANSFORM_FLAG $TF_FLAG $JOINT_STATE_FLAG \
         > /tmp/rviz_pub.log 2>&1 &
     PUB_PID=$!
 
@@ -533,7 +547,7 @@ else
         --topic "$RVIZ_BASE_TOPIC" \
         --rate "$RVIZ_RATE" \
         --color-mode "$RVIZ_COLOR_MODE" \
-        $TRANSFORM_FLAG $TF_FLAG \
+        $TRANSFORM_FLAG $TF_FLAG $JOINT_STATE_FLAG \
         > /tmp/rviz_pub.log 2>&1 &
     PUB_PID=$!
 

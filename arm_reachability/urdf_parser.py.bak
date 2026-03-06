@@ -90,15 +90,9 @@ class RobotConfig:
 class URDFParser:
     """URDF 文件解析器，支持多臂机器人"""
 
-    # 用于识别末端执行器链接的关键词（强匹配：更像真正的末端/TCP）
-    EE_STRONG_KEYWORDS = [
-        'tcp', 'end_effector', 'end effector', 'eef', 'tool', 'flange',
-    ]
-
-    # 用于识别末端执行器链接的关键词（弱匹配：仅在没有 TCP/工具链接时兜底）
-    # 注意：像 link6/link7 这类会在很多机器人 URDF 中出现，如果参与强匹配，
-    # 容易把“末端附近的中间连杆”误识别为末端，导致关节链被截断。
-    EE_WEAK_KEYWORDS = [
+    # 用于识别末端执行器链接的关键词
+    EE_KEYWORDS = [
+        'tcp', 'end_effector', 'ee', 'tool', 'flange',
         'link_7', 'link7', 'link_6', 'link6'
     ]
 
@@ -351,42 +345,21 @@ class URDFParser:
 
         return "base_link"
 
-    def _ee_link_score(self, link_name: str) -> int:
-        """
-        给“可能的末端链接”打分（分数越高越像真正的末端/TCP）。
-
-        目的：避免把 link6/link7 这类中间连杆误识别为末端，从而截断关节链。
-        """
+    def _is_arm_tcp_link(self, link_name: str) -> bool:
+        """检查链接是否是机械臂的TCP链接"""
         link_lower = link_name.lower()
 
-        # 排除夹爪/传感器等非机械臂末端
+        # 排除夹爪等非机械臂末端
         for exclude in self.EE_EXCLUDE_KEYWORDS:
             if exclude in link_lower:
-                return 0
+                return False
 
-        # 强匹配（按优先级给分）
-        if 'tcp' in link_lower:
-            return 100
-        if 'end_effector' in link_lower or 'end effector' in link_lower:
-            return 90
-        if 'eef' in link_lower or '_ee' in link_lower or link_lower.endswith('ee'):
-            return 80
-        if 'tool' in link_lower:
-            return 70
-        if 'flange' in link_lower:
-            return 60
-
-        # 弱匹配兜底（仅当没有更强候选时使用）
-        for keyword in self.EE_WEAK_KEYWORDS:
+        # 检查是否包含TCP关键词
+        for keyword in self.EE_KEYWORDS:
             if keyword in link_lower:
-                # 更倾向 link7 而不是 link6（通常更靠近末端）
-                return 25 if '7' in keyword else 15
+                return True
 
-        return 0
-
-    def _is_arm_tcp_link(self, link_name: str) -> bool:
-        """检查链接是否可能是机械臂的末端/TCP链接"""
-        return self._ee_link_score(link_name) > 0
+        return False
 
     def _get_arm_prefix(self, link_name: str) -> Optional[str]:
         """从链接名称提取机械臂前缀"""
@@ -412,30 +385,12 @@ class URDFParser:
 
     def _get_arm_side(self, link_name: str) -> Optional[str]:
         """判断机械臂是左臂还是右臂"""
-        # 首先尝试从前缀判断（更精确，避免 _link 中的 _l 误匹配）
-        prefix = self._get_arm_prefix(link_name)
-        if prefix:
-            # 检查前缀是否以 L/R 结尾
-            if prefix.endswith('L') or prefix.endswith('l'):
-                return 'left'
-            if prefix.endswith('R') or prefix.endswith('r'):
-                return 'right'
-            # 检查前缀是否包含 left/right
-            prefix_lower = prefix.lower()
-            if 'left' in prefix_lower:
-                return 'left'
-            if 'right' in prefix_lower:
-                return 'right'
-        
-        # 回退：检查完整名称是否包含 left/right 单词
         link_lower = link_name.lower()
-        if 'left' in link_lower:
-            return 'left'
-        if 'right' in link_lower:
-            return 'right'
-        
+        for side, patterns in self.ARM_PATTERNS.items():
+            for pattern in patterns:
+                if pattern.lower() in link_lower:
+                    return side
         return None
-
 
     def detect_arm_chains(self) -> List[ArmChain]:
         """
@@ -446,24 +401,21 @@ class URDFParser:
         """
         link_names = {link.name for link in self._links}
 
-        # 找出所有“可能的末端链接”，并按分数排序（优先选真正的 tcp/tool 等）
-        candidates: List[Tuple[int, str]] = []
+        # 找出所有看起来像机械臂TCP的链接
+        tcp_links = []
         for link in self._links:
-            score = self._ee_link_score(link.name)
-            if score > 0:
-                candidates.append((score, link.name))
+            if self._is_arm_tcp_link(link.name):
+                tcp_links.append(link.name)
 
-        if not candidates:
+        if not tcp_links:
             # 如果没找到明确的TCP，查找最长的运动链
             return []
-
-        candidates.sort(key=lambda x: (-x[0], x[1]))
 
         # 为每个TCP链接构建机械臂链
         arm_chains = []
         processed_prefixes = set()
 
-        for _, tcp_link in candidates:
+        for tcp_link in tcp_links:
             # 提取前缀避免重复
             prefix = self._get_arm_prefix(tcp_link)
             if prefix and prefix in processed_prefixes:
@@ -839,11 +791,12 @@ class CuroboConfigGenerator:
 
         # 生成自碰撞配置
         collision_spheres = self._generate_collision_spheres()
-        self_collision_ignore = self._generate_self_collision_ignore(collision_spheres)
         collision_config = {
             'collision_spheres': collision_spheres,
-            'self_collision_ignore': self_collision_ignore,
-            'self_collision_buffer': {},
+            'buffer_distance': 0.005,
+            'self_collision_buffer': {
+                'default': 0.02,
+            }
         }
 
         # 完整配置
@@ -870,43 +823,12 @@ class CuroboConfigGenerator:
 
         for link in self.robot.links:
             if link.name in chain_links:
-                # 使用小半径碰撞球，避免相邻 link 的球过度重叠
+                # 为每个链接创建基本球体
                 spheres[link.name] = [
-                    {'center': [0.0, 0.0, 0.0], 'radius': 0.02}
+                    {'center': [0.0, 0.0, 0.0], 'radius': 0.05}
                 ]
 
         return spheres
-
-    def _generate_self_collision_ignore(self, collision_spheres: Dict) -> Dict[str, List[str]]:
-        """
-        生成自碰撞忽略列表。
-
-        由于使用简单的单球近似（每个 link 原点一个球），
-        相邻和近邻 link 的球在运动时容易误碰撞。因此忽略运动链上
-        距离 <= 2 个 link 的碰撞对。
-        """
-        sphere_links = set(collision_spheres.keys())
-
-        # 构建 link 邻接关系
-        adjacency = {}
-        for joint in self.robot.joints:
-            p, c = joint.parent_link, joint.child_link
-            if p in sphere_links and c in sphere_links:
-                adjacency.setdefault(p, set()).add(c)
-                adjacency.setdefault(c, set()).add(p)
-
-        # 忽略距离 <= 2 的 link 对（直接相邻 + 间隔1个的）
-        ignore = {}
-        for link in sphere_links:
-            neighbors = adjacency.get(link, set())
-            neighbors_2 = set()
-            for n in neighbors:
-                neighbors_2 |= adjacency.get(n, set())
-            all_ignore = (neighbors | neighbors_2) - {link}
-            if all_ignore:
-                ignore[link] = sorted(all_ignore & sphere_links)
-
-        return ignore
 
     def generate_ik_config(self) -> Dict[str, Any]:
         """为 cuRobo 生成 IK 求解器配置"""

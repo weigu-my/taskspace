@@ -90,6 +90,11 @@ def main():
     parser.add_argument('--color-mode', type=str, default='dexterity',
                         choices=['dexterity', 'arm', 'tint'],
                         help='颜色模式: dexterity(灵活度色阶), arm(固定臂色), tint(臂色偏色+灵活度)')
+    parser.add_argument('--subscribe-joint-states', action='store_true',
+                        help='订阅 /joint_states 话题（配合 joint_state_publisher_gui 使用）。'
+                             '当关节状态变化时自动更新 TF，使点云跟随机器人姿态变化')
+    parser.add_argument('--joint-states-topic', type=str, default='/joint_states',
+                        help='JointState 订阅话题名称')
 
     # 解析参数
     args, unknown = parser.parse_known_args()
@@ -241,11 +246,15 @@ def main():
         arms=arms,
         publish_tf=not args.no_tf,  # 当 robot_state_publisher 运行时禁用 TF
         use_base_transform_rotation=not args.translation_only,
-        color_mode=args.color_mode
+        color_mode=args.color_mode,
+        subscribe_joint_states=args.subscribe_joint_states,
+        joint_states_topic=args.joint_states_topic,
     )
 
     if args.no_tf:
         print("[TF] 禁用 TF 发布（依赖 robot_state_publisher）")
+    if args.subscribe_joint_states:
+        print(f"[JointState] 订阅 {args.joint_states_topic}（点云将跟随机器人姿态变化）")
 
     publisher = RVizReachabilityPublisher(config)
 
