@@ -77,6 +77,12 @@ class RVizPublisherConfig:
     # JointState 订阅 Topic
     joint_states_topic: str = "/joint_states"
 
+    # 动态可达性过滤：根据对侧臂姿态实时过滤可达点
+    dynamic_filter: bool = False
+
+    # URDF 路径（动态过滤需要用于 pinocchio FK）
+    urdf_path: str = ""
+
 
 class RVizReachabilityPublisher:
     """
@@ -106,6 +112,9 @@ class RVizReachabilityPublisher:
         self._arm_joint_states = {}  # {arm_name: {joint_name: position}}
         self._arm_joint_names = {}  # {arm_name: [joint_names]} 缓存各臂关节名
         self._joint_state_callbacks = []  # 外部回调列表
+
+        # 动态过滤器 {arm_name: DynamicReachabilityFilter}
+        self._dynamic_filters = {}
 
     def _ensure_ros_init(self):
         """确保 ROS 2 已初始化"""
@@ -302,6 +311,116 @@ class RVizReachabilityPublisher:
     def get_all_joint_states(self) -> dict:
         """获取所有臂的当前关节状态"""
         return self._arm_joint_states.copy()
+
+    def _init_dynamic_filters(self):
+        """
+        初始化动态可达性过滤器
+
+        从各臂数据目录加载 dynamic_filter_config.json，
+        创建 DynamicReachabilityFilter 实例。
+        """
+        from .dynamic_filter import DynamicReachabilityFilter
+
+        urdf_path = self.config.urdf_path
+        if not urdf_path:
+            # 尝试从臂配置获取
+            for arm in self.config.arms:
+                if arm.urdf_path and os.path.exists(arm.urdf_path):
+                    urdf_path = arm.urdf_path
+                    break
+
+        if not urdf_path or not os.path.exists(urdf_path):
+            self._node.get_logger().warn(
+                '[动态过滤] 无法找到 URDF 文件，跳过动态过滤器初始化'
+            )
+            return
+
+        for arm in self.config.arms:
+            if not arm.data_dir or arm.name not in self._results:
+                continue
+
+            config_data = DynamicReachabilityFilter.load_config(arm.data_dir)
+            if config_data is None:
+                self._node.get_logger().warn(
+                    f'[动态过滤] {arm.name} 臂: 未找到 dynamic_filter_config.json，跳过'
+                )
+                continue
+
+            result = self._results[arm.name]
+            try:
+                filt = DynamicReachabilityFilter(
+                    urdf_path=urdf_path,
+                    arm_name=config_data['arm_name'],
+                    base_link=config_data['base_link'],
+                    max_reachable_mask=result.reachable_mask.copy(),
+                    grid_points=result.grid_points,
+                    dexterity=result.dexterity,
+                    manipulability=result.manipulability,
+                    other_arm_spheres_local=config_data['other_arm_spheres_local'],
+                )
+                self._dynamic_filters[arm.name] = filt
+                self._node.get_logger().info(
+                    f'[动态过滤] {arm.name} 臂: 过滤器已初始化'
+                )
+            except Exception as e:
+                self._node.get_logger().error(
+                    f'[动态过滤] {arm.name} 臂: 初始化失败: {e}'
+                )
+
+        if self._dynamic_filters:
+            # 注册 joint state 回调用于动态过滤
+            self.register_joint_state_callback(self._on_dynamic_filter_update)
+            self._node.get_logger().info(
+                f'[动态过滤] 已注册动态过滤回调，{len(self._dynamic_filters)} 个过滤器就绪'
+            )
+
+    def _on_dynamic_filter_update(self, changed_arms, all_states):
+        """
+        当关节状态变化时，重新过滤可达点并发布更新后的点云
+
+        动态过滤逻辑：
+        - 当臂 A 的姿态变化时，需要更新臂 B 的可达空间（因为 A 的碰撞球位置变了）
+        - 每个过滤器从最大可达空间重新开始过滤
+        """
+        if not self._dynamic_filters:
+            return
+
+        # 合并所有臂的关节状态为统一的 {joint_name: position}
+        all_joint_positions = {}
+        for arm_name, states in all_states.items():
+            all_joint_positions.update(states)
+
+        # 对每个有动态过滤器的臂执行过滤
+        for arm in self.config.arms:
+            if arm.name not in self._dynamic_filters:
+                continue
+
+            filt = self._dynamic_filters[arm.name]
+            result = self._results.get(arm.name)
+            if result is None:
+                continue
+
+            try:
+                # 用全机器人关节状态进行过滤
+                filtered_mask = filt.filter(all_joint_positions)
+
+                # 更新结果中的可达掩码
+                result.reachable_mask = filtered_mask
+                result.reachable_count = int(np.sum(filtered_mask))
+
+                # 重新发布点云
+                self.publish_pointcloud(arm, result)
+
+                n_filtered = filt.n_filtered_out
+                if n_filtered > 0:
+                    self._node.get_logger().info(
+                        f'[动态过滤] {arm.name} 臂: '
+                        f'过滤 {n_filtered} 点, 剩余 {result.reachable_count} 点'
+                    )
+            except Exception as e:
+                self._node.get_logger().error(
+                    f'[动态过滤] {arm.name} 臂: 过滤失败: {e}'
+                )
 
     def _rpy_to_matrix(self, roll: float, pitch: float, yaw: float) -> np.ndarray:
         cr, sr = math.cos(roll), math.sin(roll)
@@ -1041,6 +1160,10 @@ class RVizReachabilityPublisher:
                     self._node.get_logger().info(
                         f'加载 {arm.name} 臂数据: {result.reachable_count} 个可达点'
                     )
+
+        # 初始化动态过滤器（如果启用）
+        if self.config.dynamic_filter:
+            self._init_dynamic_filters()
 
         # 发布一次机器人描述（latched）
         for arm in self.config.arms:

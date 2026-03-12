@@ -150,7 +150,9 @@ class ReachabilityAnalyzer:
         config: ReachabilityConfig = None,
         robot_config: RobotConfig = None,
         world_config: Optional[Any] = None,
-        urdf_path: str = None
+        urdf_path: str = None,
+        other_arm_links: Optional[set] = None,
+        dynamic_mode: bool = False
     ):
         """
         初始化可达性分析器
@@ -161,6 +163,8 @@ class ReachabilityAnalyzer:
             world_config: cuRobo WorldConfig对象，用于环境碰撞检测
                          可以包含机器人躯体、另一臂等障碍物
             urdf_path: URDF文件路径（如果config未提供）
+            other_arm_links: 对侧臂的 link 名称集合（动态模式使用）
+            dynamic_mode: 是否启用动态可达性模式
         """
         # 支持仅传入urdf_path的简化用法
         if config is None:
@@ -172,6 +176,8 @@ class ReachabilityAnalyzer:
         self.config = config
         self.robot_config: Optional[RobotConfig] = robot_config
         self.world_config = world_config  # 环境碰撞配置
+        self._other_arm_links = other_arm_links
+        self._dynamic_mode = dynamic_mode
         self.ik_solver: Optional[MultiSeedIKSolver] = None
         self.manipulability_calc: Optional[ManipulabilityCalculator] = None
 
@@ -206,7 +212,9 @@ class ReachabilityAnalyzer:
             robot_config=self.robot_config,
             ik_config=self.config.ik,
             device=self.config.device,
-            world_config=self.world_config
+            world_config=self.world_config,
+            other_arm_links=self._other_arm_links,
+            dynamic_mode=self._dynamic_mode
         )
 
         # 初始化可操作度计算器
@@ -592,14 +600,16 @@ class MultiArmReachabilityAnalyzer:
     支持同时分析多条机械臂的可达空间。
     """
 
-    def __init__(self, config: ReachabilityConfig):
+    def __init__(self, config: ReachabilityConfig, dynamic_mode: bool = False):
         """
         初始化多臂分析器
 
         参数:
             config: 可达性分析配置
+            dynamic_mode: 是否启用动态可达性模式（对侧臂碰撞实时过滤）
         """
         self.config = config
+        self.dynamic_mode = dynamic_mode
         self.parser = URDFParser(config.urdf_path)
         self.arm_chains: List[ArmChain] = []
         self.results: Dict[str, ReachabilityResult] = {}
@@ -685,6 +695,26 @@ class MultiArmReachabilityAnalyzer:
 
         results = {}
 
+        # 预计算：收集所有臂的 chain links（用于动态模式下互斥）
+        all_arm_chain_links = {}
+        if self.dynamic_mode:
+            for chain in arms_to_analyze:
+                # 收集该臂的所有运动 link（chain + 子孙）
+                chain_links = set(chain.chain_links)
+                child_map = {}
+                for j in self.parser._joints:
+                    child_map.setdefault(j.parent_link, []).append(j.child_link)
+                stack = list(chain_links)
+                all_moving = set(chain_links)
+                while stack:
+                    current = stack.pop()
+                    for child in child_map.get(current, []):
+                        if child not in all_moving:
+                            all_moving.add(child)
+                            stack.append(child)
+                all_arm_chain_links[chain.name] = all_moving
+            print(f"[动态模式] 各臂运动 link: {{{', '.join(f'{k}: {len(v)}' for k, v in all_arm_chain_links.items())}}}")
+
         for idx, arm_chain in enumerate(arms_to_analyze):
             print(f"\n{'='*60}")
             print(f"分析臂 {idx+1}/{len(arms_to_analyze)}: {arm_chain.name}")
@@ -703,6 +733,14 @@ class MultiArmReachabilityAnalyzer:
                 chain_links=arm_chain.chain_links
             )
 
+            # 动态模式：收集对侧臂的 link 集合
+            other_arm_links = None
+            if self.dynamic_mode:
+                other_arm_links = set()
+                for other_name, other_links in all_arm_chain_links.items():
+                    if other_name != arm_chain.name:
+                        other_arm_links |= other_links
+
             # 创建该臂的配置副本
             arm_config = self.config.copy()
             arm_config.base_link = arm_chain.base_link
@@ -713,12 +751,33 @@ class MultiArmReachabilityAnalyzer:
             color = self.config.multi_arm.get_arm_color(arm_chain.name, idx)
 
             # 创建分析器并执行分析
-            analyzer = ReachabilityAnalyzer(arm_config, robot_config)
+            analyzer = ReachabilityAnalyzer(
+                arm_config, robot_config,
+                other_arm_links=other_arm_links,
+                dynamic_mode=self.dynamic_mode
+            )
             result = analyzer.analyze(arm_name=arm_chain.name, color=color)
 
             # 保存结果
             prefix = f"reachability_{arm_chain.name}"
             analyzer.save_results(result, prefix=prefix)
+
+            # 动态模式：保存对侧臂碰撞球配置
+            if self.dynamic_mode and hasattr(analyzer.ik_solver, '_other_arm_collision_spheres'):
+                other_spheres = analyzer.ik_solver._other_arm_collision_spheres
+                if other_spheres:
+                    from .dynamic_filter import DynamicReachabilityFilter
+                    filter_obj = DynamicReachabilityFilter(
+                        urdf_path=self.config.urdf_path,
+                        arm_name=arm_chain.name,
+                        base_link=arm_chain.base_link,
+                        max_reachable_mask=result.reachable_mask,
+                        grid_points=result.grid_points,
+                        dexterity=result.dexterity,
+                        manipulability=result.manipulability,
+                        other_arm_spheres_local=other_spheres,
+                    )
+                    filter_obj.save_config(arm_config.output_dir)
 
             results[arm_chain.name] = result
 

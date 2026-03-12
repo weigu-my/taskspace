@@ -52,7 +52,9 @@ class MultiSeedIKSolver:
         robot_config: RobotConfig,
         ik_config: IKConfig,
         device: str = "cuda:0",
-        world_config: Optional[Any] = None
+        world_config: Optional[Any] = None,
+        other_arm_links: Optional[set] = None,
+        dynamic_mode: bool = False
     ):
         """
         初始化多种子IK求解器
@@ -63,11 +65,15 @@ class MultiSeedIKSolver:
             device: 计算设备
             world_config: cuRobo WorldConfig对象，用于环境碰撞检测
                          可以包含机器人躯体、另一臂等障碍物
+            other_arm_links: 对侧臂的 link 名称集合（动态模式下从静态障碍物中排除）
+            dynamic_mode: 是否启用动态可达性模式
         """
         self.robot_config = robot_config
         self.ik_config = ik_config
         self.device = device
         self.world_config = world_config  # 环境碰撞配置
+        self._other_arm_links = other_arm_links or set()
+        self._dynamic_mode = dynamic_mode
         self.ik_solver = None
         self.tensor_args = None
         self._current_batch_size = None  # 跟踪当前批次大小
@@ -280,7 +286,13 @@ class MultiSeedIKSolver:
                 else:
                     break  # 遇到非 fixed joint 就停止
 
-            print(f"[IK求解器] 从 URDF mesh 生成碰撞球（chain links: {len(chain_links)}，运动 links: {len(moving_links)}）...")
+            # 动态模式下：对侧臂 link 也排除出静态障碍物，单独保存用于动态过滤
+            exclude_from_body = set(moving_links)
+            if self._dynamic_mode and self._other_arm_links:
+                exclude_from_body |= self._other_arm_links
+                print(f"[IK求解器] 动态模式: 对侧臂 {len(self._other_arm_links)} 个 link 排除出静态障碍物")
+
+            print(f"[IK求解器] 从 URDF mesh 生成碰撞球（chain links: {len(chain_links)}，排除 links: {len(exclude_from_body)}）...")
 
             # 只为 chain links 生成碰撞球（用于自碰撞检测）
             config = generate_collision_spheres_yaml(
@@ -291,17 +303,31 @@ class MultiSeedIKSolver:
             )
 
             # 为非运动 links 生成环境碰撞障碍物
-            # 排除所有随机械臂运动的 link（chain links + 其子孙如夹爪）
             body_config = generate_collision_spheres_yaml(
                 urdf_path=self.robot_config.urdf_path,
                 output_path=None,
                 max_spheres_per_link=6,
-                exclude_links=list(moving_links),
+                exclude_links=list(exclude_from_body),
             )
 
             if body_config and body_config.get('collision_spheres'):
                 self._body_collision_spheres = body_config['collision_spheres']
-                print(f"[IK求解器] 非链接 link 碰撞球: {len(self._body_collision_spheres)} 个 link（作为环境障碍物）")
+                print(f"[IK求解器] 静态身体碰撞球: {len(self._body_collision_spheres)} 个 link（作为环境障碍物）")
+
+            # 动态模式：单独为对侧臂 link 生成碰撞球（link 局部坐标系，用于动态 FK 变换）
+            self._other_arm_collision_spheres = {}
+            if self._dynamic_mode and self._other_arm_links:
+                other_arm_config = generate_collision_spheres_yaml(
+                    urdf_path=self.robot_config.urdf_path,
+                    output_path=None,
+                    max_spheres_per_link=6,
+                    include_links=list(self._other_arm_links),
+                )
+                if other_arm_config and other_arm_config.get('collision_spheres'):
+                    self._other_arm_collision_spheres = other_arm_config['collision_spheres']
+                    n_spheres = sum(len(v) for v in self._other_arm_collision_spheres.values())
+                    print(f"[IK求解器] 对侧臂碰撞球: {len(self._other_arm_collision_spheres)} 个 link, "
+                          f"{n_spheres} 个球（用于动态过滤）")
             else:
                 self._body_collision_spheres = {}
 

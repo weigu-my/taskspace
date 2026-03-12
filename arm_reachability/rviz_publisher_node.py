@@ -95,9 +95,17 @@ def main():
                              '当关节状态变化时自动更新 TF，使点云跟随机器人姿态变化')
     parser.add_argument('--joint-states-topic', type=str, default='/joint_states',
                         help='JointState 订阅话题名称')
+    parser.add_argument('--dynamic', action='store_true',
+                        help='启用动态可达性过滤：根据对侧臂姿态实时过滤碰撞区域。'
+                             '需要预计算阶段生成的 dynamic_filter_config.json。'
+                             '自动启用 --subscribe-joint-states')
 
     # 解析参数
     args, unknown = parser.parse_known_args()
+
+    # --dynamic 自动启用 --subscribe-joint-states
+    if args.dynamic:
+        args.subscribe_joint_states = True
 
     # 添加模块路径
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -249,12 +257,16 @@ def main():
         color_mode=args.color_mode,
         subscribe_joint_states=args.subscribe_joint_states,
         joint_states_topic=args.joint_states_topic,
+        dynamic_filter=args.dynamic,
+        urdf_path=args.urdf or '',
     )
 
     if args.no_tf:
         print("[TF] 禁用 TF 发布（依赖 robot_state_publisher）")
     if args.subscribe_joint_states:
         print(f"[JointState] 订阅 {args.joint_states_topic}（点云将跟随机器人姿态变化）")
+    if args.dynamic:
+        print("[动态过滤] 已启用动态可达性过滤（对侧臂碰撞实时排除）")
 
     publisher = RVizReachabilityPublisher(config)
 

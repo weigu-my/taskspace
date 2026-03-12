@@ -269,6 +269,12 @@ def parse_args():
         default=None,
         help='YAML配置文件路径'
     )
+    parser.add_argument(
+        '--dynamic',
+        action='store_true',
+        help='启用动态可达性模式：预计算时分离对侧臂碰撞球，'
+             '生成 dynamic_filter_config.json 供实时过滤使用'
+    )
 
     return parser.parse_args()
 
@@ -415,7 +421,8 @@ def run_single_arm_analysis(config: ReachabilityConfig, args) -> ReachabilityRes
 
 def run_multi_arm_analysis(config: ReachabilityConfig, args) -> MultiArmReachabilityResult:
     """运行多臂分析"""
-    analyzer = MultiArmReachabilityAnalyzer(config)
+    dynamic_mode = getattr(args, 'dynamic', False)
+    analyzer = MultiArmReachabilityAnalyzer(config, dynamic_mode=dynamic_mode)
     result = analyzer.analyze()
 
     # 保存配置
@@ -518,6 +525,8 @@ def main():
     print(f"  姿态模式: {config.orientation.mode.value}")
     print(f"  设备: {config.device}")
     print(f"  输出目录: {config.output_dir}")
+    if args.dynamic:
+        print(f"  动态可达性: 启用（对侧臂碰撞实时过滤）")
 
     # 根据模式选择分析器
     is_multi_arm = config.multi_arm.mode in [ArmMode.BOTH, ArmMode.ALL]
